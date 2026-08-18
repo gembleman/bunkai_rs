@@ -1,12 +1,23 @@
-use once_cell::sync::Lazy;
-use regex::Regex;
-use std::cmp::Ordering;
+/// Core sentence-boundary disambiguation pipeline.
+///
+/// Design notes for performance:
+///
+/// * `SpanRecord` borrows its `split_value` from the input text (`&'a str`)
+///   instead of owning a `String`, so cloning/collecting spans is a cheap
+///   memcpy rather than a heap allocation per record. Ownership is only
+///   materialised into `String`s at the public [`Span`] boundary.
+/// * The two regexes of the original port (basic punctuators and forced line
+///   breaks) are replaced by hand-written scanners that are *byte-for-byte*
+///   faithful to what `regex` matched, including its `\s` == `\p{White_Space}`
+///   definition (25 codepoints, verified empirically). This removes the
+///   byte→char offset translation both regular expressions required.
+/// * The emoji category table is a sorted, unique `&[(u32, Option<&str>)]`
+///   that is binary-searched instead of being built into a `HashMap`.
+/// * `unify_span_annotations` sorts and dedups in place instead of building a
+///   `HashMap` keyed by a formatted string.
 use std::collections::{HashMap, HashSet};
 
 use crate::emoji_data;
-
-const BASIC_RULE_RE: &str = "[。!?.！？．]+\\s*";
-const LINEBREAK_RE: &str = "[\\n\\s]*\\n[\\n\\s]*";
 
 const TARGET_EMOJI_CATEGORIES: &[&str] = &["Smileys & Emotion", "Symbols"];
 const INDIRECT_RULE_TARGETS: &[&str] = &[
@@ -33,17 +44,6 @@ const MORPHEME_RULES: &[&[&str]] = &[
     &["ほど", "でし"],
 ];
 
-static BASIC_RULE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(BASIC_RULE_RE).unwrap());
-static LINEBREAK_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(LINEBREAK_RE).unwrap());
-
-static EMOJI_CATEGORY_MAP: Lazy<HashMap<u32, Option<&'static str>>> = Lazy::new(|| {
-    let mut map = HashMap::with_capacity(emoji_data::EMOJI_DATA.len());
-    for (codepoint, category) in emoji_data::EMOJI_DATA.iter().copied() {
-        map.insert(codepoint, category);
-    }
-    map
-});
-
 const FACE_SYMBOL_RANGES: &[(char, char)] = &[
     ('!', '/'),
     (':', '@'),
@@ -69,28 +69,54 @@ const EMOTION_WORDS: &[&str] = &[
 const EMOTION_SYMBOLS: &[char] = &['…', '★', '☆', '♪'];
 const EMOTION_PUNCTUATION: &[char] = &['。', '!', '?', '！', '？', '．', '.'];
 
+/// The basic punctuator set `[。!?.！？．]`.
+#[inline]
+fn is_basic_punct(ch: char) -> bool {
+    matches!(ch, '。' | '!' | '?' | '.' | '！' | '？' | '．')
+}
+
+/// Unicode White\_Space — exactly what `regex`'s `\s` matched (verified over
+/// the whole Unicode range, 25 codepoints).
+#[inline]
+fn is_ws(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0009}'..='\u{000D}'
+            | '\u{0020}'
+            | '\u{0085}'
+            | '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200A}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202F}'
+            | '\u{205F}'
+            | '\u{3000}'
+    )
+}
+
 #[derive(Clone, Debug)]
-pub(crate) struct SpanRecord {
+pub(crate) struct SpanRecord<'a> {
     pub(crate) rule_name: &'static str,
     pub(crate) start: usize,
     pub(crate) end: usize,
     pub(crate) split_type: Option<&'static str>,
-    pub(crate) split_value: Option<String>,
+    pub(crate) split_value: Option<&'a str>,
 }
 
 #[derive(Clone)]
-pub(crate) struct LayerOutput {
+pub(crate) struct LayerOutput<'a> {
     pub(crate) name: &'static str,
-    pub(crate) spans: Vec<SpanRecord>,
+    pub(crate) spans: Vec<SpanRecord<'a>>,
 }
 
-struct PipelineState {
-    layers: Vec<LayerOutput>,
+struct PipelineState<'a> {
+    layers: Vec<LayerOutput<'a>>,
     name_to_index: HashMap<&'static str, usize>,
     final_index: usize,
 }
 
-impl PipelineState {
+impl<'a> PipelineState<'a> {
     fn new(char_len: usize) -> Self {
         let sentinel_start = if char_len == 0 { 0 } else { char_len - 1 };
         let sentinel = SpanRecord {
@@ -113,44 +139,44 @@ impl PipelineState {
         }
     }
 
-    fn final_spans(&self) -> &[SpanRecord] {
+    fn final_spans(&self) -> &[SpanRecord<'a>] {
         &self.layers[self.final_index].spans
     }
 
-    fn get_layer(&self, name: &'static str) -> Option<&[SpanRecord]> {
+    fn get_layer(&self, name: &'static str) -> Option<&[SpanRecord<'a>]> {
         self.name_to_index
             .get(name)
             .map(|idx| self.layers[*idx].spans.as_slice())
     }
 
-    fn add_layer(&mut self, name: &'static str, spans: Vec<SpanRecord>) {
+    fn add_layer(&mut self, name: &'static str, spans: Vec<SpanRecord<'a>>) {
         let idx = self.layers.len();
         self.layers.push(LayerOutput { name, spans });
         self.name_to_index.insert(name, idx);
         self.final_index = idx;
     }
 
-    fn add_forward_rule(&mut self, name: &'static str, spans: Vec<SpanRecord>) {
+    fn add_forward_rule(&mut self, name: &'static str, spans: Vec<SpanRecord<'a>>) {
         let filtered = filter_previous_rule_same_span(spans, self.final_spans());
         self.add_layer(name, filtered);
     }
 
-    fn into_output(self) -> PipelineOutput {
-        let mut unique: HashSet<usize> = HashSet::new();
+    fn into_output(self) -> PipelineOutput<'a> {
+        let mut bounds: Vec<usize> = Vec::with_capacity(self.layers[self.final_index].spans.len());
         for span in &self.layers[self.final_index].spans {
-            unique.insert(span.end);
+            bounds.push(span.end);
         }
-        let mut final_boundaries: Vec<usize> = unique.into_iter().collect();
-        final_boundaries.sort_unstable();
+        bounds.sort_unstable();
+        bounds.dedup();
         PipelineOutput {
             layers: self.layers,
-            final_boundaries,
+            final_boundaries: bounds,
         }
     }
 }
 
-pub(crate) struct PipelineOutput {
-    pub(crate) layers: Vec<LayerOutput>,
+pub(crate) struct PipelineOutput<'a> {
+    pub(crate) layers: Vec<LayerOutput<'a>>,
     pub(crate) final_boundaries: Vec<usize>,
 }
 
@@ -162,11 +188,14 @@ pub(crate) struct TextView<'a> {
 
 impl<'a> TextView<'a> {
     pub(crate) fn new(text: &'a str) -> Self {
-        let mut chars = Vec::new();
-        let mut char_to_byte = Vec::new();
-        for (byte_idx, ch) in text.char_indices() {
-            chars.push(ch);
-            char_to_byte.push(byte_idx);
+        let chars: Vec<char> = text.chars().collect();
+        // Build byte offsets in a second pass over the (cheap) char Vec rather
+        // than re-decoding UTF-8 bytes.
+        let mut char_to_byte = Vec::with_capacity(chars.len() + 1);
+        let mut byte = 0usize;
+        for ch in &chars {
+            char_to_byte.push(byte);
+            byte += ch.len_utf8();
         }
         Self {
             text,
@@ -175,50 +204,40 @@ impl<'a> TextView<'a> {
         }
     }
 
-    fn text(&self) -> &'a str {
-        self.text
-    }
-
     fn char_len(&self) -> usize {
         self.chars.len()
     }
 
+    #[inline]
     fn char_at(&self, index: usize) -> Option<char> {
         self.chars.get(index).copied()
     }
 
+    /// Byte offset of a character index, clamped to `text.len()`.
+    #[inline]
+    fn byte_at(&self, index: usize) -> usize {
+        if index >= self.char_to_byte.len() {
+            self.text.len()
+        } else {
+            self.char_to_byte[index]
+        }
+    }
+
     fn slice(&self, start: usize, end: usize) -> &'a str {
-        let start_byte = if start >= self.char_to_byte.len() {
-            self.text.len()
-        } else {
-            self.char_to_byte[start]
-        };
-        let end_byte = if end >= self.char_to_byte.len() {
-            self.text.len()
-        } else {
-            self.char_to_byte[end]
-        };
+        let start_byte = self.byte_at(start);
+        let end_byte = self.byte_at(end);
         &self.text[start_byte..end_byte]
     }
 
-    fn byte_to_char_index(&self, byte: usize) -> usize {
-        match self.char_to_byte.binary_search(&byte) {
-            Ok(idx) => idx,
-            Err(idx) => idx,
-        }
-    }
-
+    /// Byte-wise `starts_with` at a character index. `index` must be a char
+    /// boundary (it always is: every caller hands it a previously decoded
+    /// character index).
+    #[inline]
     fn starts_with(&self, index: usize, pattern: &str) -> bool {
-        let pattern_chars: Vec<char> = pattern.chars().collect();
-        if index + pattern_chars.len() > self.char_len() {
+        let Some(&start_byte) = self.char_to_byte.get(index) else {
             return false;
-        }
-        for (offset, ch) in pattern_chars.iter().enumerate() {
-            if self.chars[index + offset] != *ch {
-                return false;
-            }
-        }
-        true
+        };
+        self.text[start_byte..].starts_with(pattern)
     }
 }
 
@@ -226,7 +245,8 @@ impl<'a> TextView<'a> {
 struct EmojiSpan {
     start: usize,
     end: usize,
-    categories: Vec<Option<&'static str>>,
+    /// Whether any character in the run belongs to a target category.
+    any_target: bool,
 }
 
 fn is_in_ranges(ch: char, ranges: &[(char, char)]) -> bool {
@@ -256,8 +276,40 @@ fn is_face_symbol1(ch: char) -> bool {
     is_ascii_alnum(ch) || is_fullwidth_alnum(ch) || is_face_symbol2(ch)
 }
 
-fn find_face_marks(view: &TextView<'_>) -> Vec<SpanRecord> {
-    let mut spans: Vec<SpanRecord> = Vec::new();
+/// Existence + category of an emoji codepoint, via binary search over the
+/// sorted, unique `emoji_data::EMOJI_DATA`.
+///
+/// Returns `Some(entry)` when the codepoint IS present in the emoji table
+/// (`entry` is the stored category, which may itself be `None` for e.g.
+/// skin-tone modifiers), and `None` when the codepoint is not an emoji at
+/// all. The original port keyed membership by table presence — a codepoint
+/// with a `None` category still belongs to emoji *runs* — so callers must
+/// distinguish those two cases.
+///
+/// A hand-written lower-bound loop instead of `slice::binary_search_by_key`
+/// so the whole lookup inlines into the scanning hot loop.
+#[inline]
+fn emoji_lookup(codepoint: u32) -> Option<&'static Option<&'static str>> {
+    let data = emoji_data::EMOJI_DATA;
+    let mut lo = 0usize;
+    let mut hi = data.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if data[mid].0 < codepoint {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo < data.len() && data[lo].0 == codepoint {
+        Some(&data[lo].1)
+    } else {
+        None
+    }
+}
+
+fn find_face_marks<'a>(view: &TextView<'a>) -> Vec<SpanRecord<'a>> {
+    let mut spans: Vec<SpanRecord<'_>> = Vec::new();
     let len = view.char_len();
     let mut idx = 0usize;
 
@@ -307,7 +359,7 @@ fn find_face_marks(view: &TextView<'_>) -> Vec<SpanRecord> {
             start,
             end,
             split_type: Some("facemark"),
-            split_value: Some(view.slice(start, end).to_string()),
+            split_value: Some(view.slice(start, end)),
         });
         idx = end;
     }
@@ -315,8 +367,8 @@ fn find_face_marks(view: &TextView<'_>) -> Vec<SpanRecord> {
     spans
 }
 
-fn find_emotion_expressions(view: &TextView<'_>) -> Vec<SpanRecord> {
-    let mut spans: Vec<SpanRecord> = Vec::new();
+fn find_emotion_expressions<'a>(view: &TextView<'a>) -> Vec<SpanRecord<'a>> {
+    let mut spans: Vec<SpanRecord<'_>> = Vec::new();
     let len = view.char_len();
 
     for idx in 0..len {
@@ -340,7 +392,7 @@ fn find_emotion_expressions(view: &TextView<'_>) -> Vec<SpanRecord> {
                         start: idx,
                         end,
                         split_type: Some("EmotionExpressionAnnotator"),
-                        split_value: Some(view.slice(idx, end).to_string()),
+                        split_value: Some(view.slice(idx, end)),
                     });
                     break;
                 }
@@ -372,14 +424,14 @@ fn find_emotion_expressions(view: &TextView<'_>) -> Vec<SpanRecord> {
             start,
             end,
             split_type: Some("EmotionExpressionAnnotator"),
-            split_value: Some(view.slice(start, end).to_string()),
+            split_value: Some(view.slice(start, end)),
         });
     }
 
     unify_span_annotations(spans)
 }
 
-pub(crate) fn segment_impl(text: &str) -> PipelineOutput {
+pub(crate) fn segment_impl(text: &str) -> PipelineOutput<'_> {
     let view = TextView::new(text);
     let mut state = PipelineState::new(view.char_len());
 
@@ -392,8 +444,7 @@ pub(crate) fn segment_impl(text: &str) -> PipelineOutput {
     let emoji_spans = build_emoji_spans(&view);
     state.add_forward_rule("EmojiAnnotator", emoji_spans);
 
-    let basic_rule_spans =
-        build_spans_from_regex(&view, "BasicRule", Some("BasicRule"), &BASIC_RULE_REGEX);
+    let basic_rule_spans = find_basic_rule(&view);
     state.add_forward_rule("BasicRule", basic_rule_spans);
 
     apply_indirect_quote(&view, &mut state);
@@ -404,107 +455,86 @@ pub(crate) fn segment_impl(text: &str) -> PipelineOutput {
     state.into_output()
 }
 
-fn build_spans_from_regex(
-    view: &TextView<'_>,
-    rule_name: &'static str,
-    split_type: Option<&'static str>,
-    regex: &Regex,
-) -> Vec<SpanRecord> {
-    regex
-        .find_iter(view.text())
-        .map(|m| {
-            let start = view.byte_to_char_index(m.start());
-            let end = view.byte_to_char_index(m.end());
-            SpanRecord {
-                rule_name,
-                start,
-                end,
-                split_type,
-                split_value: Some(view.slice(start, end).to_string()),
-            }
-        })
-        .collect()
+/// Hand-written equivalent of the old `[。!?.！？．]+\s*` regex: a maximal run
+/// of basic punctuators, then any run of Unicode whitespace.
+fn find_basic_rule<'a>(view: &TextView<'a>) -> Vec<SpanRecord<'a>> {
+    let mut spans: Vec<SpanRecord<'_>> = Vec::new();
+    let len = view.char_len();
+    let mut i = 0usize;
+    while i < len {
+        if !is_basic_punct(view.char_at(i).unwrap_or('\0')) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < len && is_basic_punct(view.char_at(i).unwrap_or('\0')) {
+            i += 1;
+        }
+        while i < len && is_ws(view.char_at(i).unwrap_or('\0')) {
+            i += 1;
+        }
+        let end = i;
+        spans.push(SpanRecord {
+            rule_name: "BasicRule",
+            start,
+            end,
+            split_type: Some("BasicRule"),
+            split_value: Some(view.slice(start, end)),
+        });
+    }
+    spans
 }
 
-fn build_emoji_spans(view: &TextView<'_>) -> Vec<SpanRecord> {
+fn build_emoji_spans<'a>(view: &TextView<'a>) -> Vec<SpanRecord<'a>> {
     let spans = find_emoji_spans(view);
     spans
         .into_iter()
-        .filter(|span| span.end > span.start)
-        .filter(|span| {
-            span.categories
-                .iter()
-                .flatten()
-                .any(|cat| TARGET_EMOJI_CATEGORIES.contains(cat))
-        })
+        .filter(|span| span.end > span.start && span.any_target)
         .map(|span| SpanRecord {
             rule_name: "EmojiAnnotator",
             start: span.start,
             end: span.end,
             split_type: Some("EmojiAnnotator"),
-            split_value: Some(view.slice(span.start, span.end).to_string()),
+            split_value: Some(view.slice(span.start, span.end)),
         })
         .collect()
 }
 
 fn find_emoji_spans(view: &TextView<'_>) -> Vec<EmojiSpan> {
     let mut spans: Vec<EmojiSpan> = Vec::new();
-    let mut in_span = false;
-    let mut start = 0usize;
-    let mut categories: Vec<Option<&'static str>> = Vec::new();
-
-    for idx in 0..view.char_len() {
-        let ch = view.char_at(idx).unwrap_or('\0');
-        let maybe_category = EMOJI_CATEGORY_MAP.get(&(ch as u32));
-        if maybe_category.is_none() {
-            if in_span {
-                spans.push(EmojiSpan {
-                    start,
-                    end: idx,
-                    categories: categories.clone(),
-                });
-                categories.clear();
-                in_span = false;
-            }
+    let len = view.char_len();
+    let mut i = 0usize;
+    while i < len {
+        // Skip plain characters; a run starts on an emoji codepoint. Table
+        // membership is what matters — "emoji" includes codepoints whose
+        // stored category is `None`, e.g. skin-tone modifiers.
+        let Some(first) = emoji_lookup(view.chars[i] as u32).copied() else {
+            i += 1;
             continue;
-        }
-
-        if !in_span {
-            in_span = true;
-            start = idx;
-        }
-        categories.push(*maybe_category.unwrap());
-
-        let next_is_emoji = if idx + 1 < view.char_len() {
-            let next_ch = view.char_at(idx + 1).unwrap_or('\0') as u32;
-            EMOJI_CATEGORY_MAP.contains_key(&next_ch)
-        } else {
-            false
         };
-        if !next_is_emoji {
-            spans.push(EmojiSpan {
-                start,
-                end: idx + 1,
-                categories: categories.clone(),
-            });
-            categories.clear();
-            in_span = false;
+        let start = i;
+        let mut any_target = first.is_some_and(|cat| TARGET_EMOJI_CATEGORIES.contains(&cat));
+        i += 1;
+        while i < len {
+            let Some(category) = emoji_lookup(view.chars[i] as u32).copied() else {
+                break;
+            };
+            if category.is_some_and(|cat| TARGET_EMOJI_CATEGORIES.contains(&cat)) {
+                any_target = true;
+            }
+            i += 1;
         }
-    }
-
-    if in_span {
         spans.push(EmojiSpan {
             start,
-            end: view.char_len(),
-            categories,
+            end: i,
+            any_target,
         });
     }
-
     spans
 }
 
-fn apply_indirect_quote(view: &TextView<'_>, state: &mut PipelineState) {
-    let mut collected: Vec<SpanRecord> = Vec::new();
+fn apply_indirect_quote<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) {
+    let mut collected: Vec<SpanRecord<'_>> = Vec::new();
     for &target in INDIRECT_RULE_TARGETS {
         if let Some(layer) = state.get_layer(target) {
             for span in layer {
@@ -524,11 +554,19 @@ fn is_exception_particle(view: &TextView<'_>, _start: usize, end: usize) -> bool
         return false;
     }
     let mut idx = end;
-    if idx >= view.char_len() {
-        return false;
-    }
     while view.char_at(idx) == Some('\n') && idx + 1 < view.char_len() {
         idx += 1;
+    }
+    // Fast reject: a rule can only match if the first character after the
+    // boundary starts one of the morpheme rules below.
+    let Some(next) = view.char_at(idx) else {
+        return false;
+    };
+    if !matches!(
+        next,
+        'て' | 'の' | 'と' | 'っ' | 'に' | 'な' | 'く' | 'も' | 'ほ'
+    ) {
+        return false;
     }
     for rule in MORPHEME_RULES {
         if matches_rule(view, idx, rule) {
@@ -548,28 +586,22 @@ fn matches_rule(view: &TextView<'_>, mut index: usize, rule: &[&str]) -> bool {
     true
 }
 
-fn unify_span_annotations(spans: Vec<SpanRecord>) -> Vec<SpanRecord> {
-    let mut map: HashMap<String, SpanRecord> = HashMap::new();
-    for span in spans {
-        let key = format!(
-            "{}-{}-{}/{}",
-            span.start,
-            span.end,
-            span.rule_name,
-            span.split_value.as_deref().unwrap_or("")
-        );
-        map.entry(key).or_insert(span);
-    }
-    let mut values: Vec<SpanRecord> = map.into_values().collect();
-    values.sort_by(|a, b| match a.start.cmp(&b.start) {
-        Ordering::Equal => a.end.cmp(&b.end),
-        other => other,
+fn unify_span_annotations(spans: Vec<SpanRecord<'_>>) -> Vec<SpanRecord<'_>> {
+    let mut spans = spans;
+    spans.sort_by(|a, b| a.start.cmp(&b.start).then(a.end.cmp(&b.end)));
+    // `dedup_by` receives the *later* element first; removing it keeps the
+    // first occurrence of each run, matching the original map-insert semantics.
+    spans.dedup_by(|later, earlier| {
+        later.start == earlier.start
+            && later.end == earlier.end
+            && later.rule_name == earlier.rule_name
+            && later.split_value == earlier.split_value
     });
-    values
+    spans
 }
 
-fn apply_dot_exception(view: &TextView<'_>, state: &mut PipelineState) {
-    let mut filtered: Vec<SpanRecord> = Vec::new();
+fn apply_dot_exception<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) {
+    let mut filtered: Vec<SpanRecord<'_>> = Vec::with_capacity(state.final_spans().len());
     for span in state.final_spans().iter() {
         if is_exception_numeric(view, span.start) || is_exception_mailaddress(view, span.start) {
             continue;
@@ -657,8 +689,8 @@ fn is_mail_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric()
 }
 
-fn apply_number_exception(view: &TextView<'_>, state: &mut PipelineState) {
-    let mut filtered: Vec<SpanRecord> = Vec::new();
+fn apply_number_exception<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) {
+    let mut filtered: Vec<SpanRecord<'_>> = Vec::with_capacity(state.final_spans().len());
     for span in state.final_spans().iter() {
         if is_exception_no(view, span) {
             continue;
@@ -668,8 +700,8 @@ fn apply_number_exception(view: &TextView<'_>, state: &mut PipelineState) {
     state.add_layer("NumberExceptionAnnotator", filtered);
 }
 
-fn is_exception_no(view: &TextView<'_>, span: &SpanRecord) -> bool {
-    let value = span.split_value.as_deref();
+fn is_exception_no(view: &TextView<'_>, span: &SpanRecord<'_>) -> bool {
+    let value = span.split_value;
     if value != Some(".") && value != Some("．") {
         return false;
     }
@@ -691,15 +723,39 @@ fn is_exception_no(view: &TextView<'_>, span: &SpanRecord) -> bool {
     next_char.is_ascii_digit()
 }
 
-fn apply_linebreak_force(view: &TextView<'_>, state: &mut PipelineState) {
+/// Hand-written equivalent of the old `[\n\s]*\n[\n\s]*` regex: a maximal run
+/// of Unicode whitespace that contains at least one newline.
+fn find_linebreaks(view: &TextView<'_>) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let len = view.char_len();
+    let mut i = 0usize;
+    while i < len {
+        if !is_ws(view.char_at(i).unwrap_or('\0')) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut has_newline = false;
+        while i < len && is_ws(view.char_at(i).unwrap_or('\0')) {
+            if view.char_at(i) == Some('\n') {
+                has_newline = true;
+            }
+            i += 1;
+        }
+        if has_newline {
+            out.push((start, i));
+        }
+    }
+    out
+}
+
+fn apply_linebreak_force<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) {
     let mut map: HashMap<usize, (usize, usize)> = HashMap::new();
-    for mat in LINEBREAK_REGEX.find_iter(view.text()) {
-        let start = view.byte_to_char_index(mat.start());
-        let end = view.byte_to_char_index(mat.end());
+    for (start, end) in find_linebreaks(view) {
         map.insert(start, (start, end));
     }
 
-    let mut result: Vec<SpanRecord> = Vec::new();
+    let mut result: Vec<SpanRecord<'_>> = Vec::with_capacity(state.final_spans().len() + map.len());
     for span in state.final_spans().iter() {
         if let Some((lb_start, lb_end)) = map.remove(&span.end) {
             result.push(SpanRecord {
@@ -707,7 +763,7 @@ fn apply_linebreak_force(view: &TextView<'_>, state: &mut PipelineState) {
                 start: lb_start,
                 end: lb_end,
                 split_type: Some("linebreak"),
-                split_value: Some(view.slice(lb_start, lb_end).to_string()),
+                split_value: Some(view.slice(lb_start, lb_end)),
             });
         } else {
             result.push(span.clone());
@@ -720,22 +776,22 @@ fn apply_linebreak_force(view: &TextView<'_>, state: &mut PipelineState) {
             start,
             end,
             split_type: Some("linebreak"),
-            split_value: Some(view.slice(start, end).to_string()),
+            split_value: Some(view.slice(start, end)),
         });
     }
 
     state.add_layer("LinebreakForceAnnotator", result);
 }
 
-fn filter_previous_rule_same_span(
-    current: Vec<SpanRecord>,
-    previous: &[SpanRecord],
-) -> Vec<SpanRecord> {
+fn filter_previous_rule_same_span<'a>(
+    current: Vec<SpanRecord<'a>>,
+    previous: &[SpanRecord<'a>],
+) -> Vec<SpanRecord<'a>> {
     let prev_keys: HashSet<(usize, usize)> =
         previous.iter().map(|span| (span.start, span.end)).collect();
     let mut seen: HashSet<(usize, usize)> = HashSet::new();
 
-    let mut filtered: Vec<SpanRecord> = Vec::new();
+    let mut filtered: Vec<SpanRecord<'_>> = Vec::with_capacity(current.len() + previous.len());
     for span in current {
         let key = (span.start, span.end);
         if prev_keys.contains(&key) {
@@ -781,20 +837,20 @@ pub struct Segmentation {
     pub final_boundaries: Vec<usize>,
 }
 
-impl From<SpanRecord> for Span {
-    fn from(record: SpanRecord) -> Self {
+impl<'a> From<SpanRecord<'a>> for Span {
+    fn from(record: SpanRecord<'a>) -> Self {
         Span {
             rule_name: record.rule_name.to_string(),
             start: record.start,
             end: record.end,
             split_type: record.split_type.map(|s| s.to_string()),
-            split_value: record.split_value,
+            split_value: record.split_value.map(|s| s.to_string()),
         }
     }
 }
 
-impl From<LayerOutput> for Layer {
-    fn from(layer: LayerOutput) -> Self {
+impl<'a> From<LayerOutput<'a>> for Layer {
+    fn from(layer: LayerOutput<'a>) -> Self {
         Layer {
             name: layer.name.to_string(),
             spans: layer.spans.into_iter().map(Span::from).collect(),
@@ -802,8 +858,8 @@ impl From<LayerOutput> for Layer {
     }
 }
 
-impl From<PipelineOutput> for Segmentation {
-    fn from(output: PipelineOutput) -> Self {
+impl<'a> From<PipelineOutput<'a>> for Segmentation {
+    fn from(output: PipelineOutput<'a>) -> Self {
         Segmentation {
             layers: output.layers.into_iter().map(Layer::from).collect(),
             final_boundaries: output.final_boundaries,
@@ -832,8 +888,17 @@ pub fn segment(text: &str) -> Segmentation {
 /// let sentences = split_sentences("これは一文目。これは二文目。");
 /// assert_eq!(sentences, vec!["これは一文目。", "これは二文目。"]);
 /// ```
+/// Run the full pipeline but only keep the final boundary offsets.
+///
+/// This is the fast path used by [`split_sentences`]: it never materialises
+/// the per-layer span records into owned [`Span`]s, which is where most of the
+/// allocation cost of [`segment`] lives.
 pub fn split_sentences(text: &str) -> Vec<&str> {
-    let boundaries = segment(text).final_boundaries;
+    split_sentences_impl(text)
+}
+
+fn split_sentences_impl(text: &str) -> Vec<&str> {
+    let boundaries = segment_impl(text).final_boundaries;
 
     // final_boundaries holds char indices; map them back to byte offsets.
     let char_to_byte: Vec<usize> = text
@@ -870,15 +935,14 @@ mod tests {
         let span = &spans[0];
         assert_eq!(span.start, 3);
         assert_eq!(span.end, 10);
-        assert_eq!(span.split_value.as_deref(), Some("(*^_^*)"));
+        assert_eq!(span.split_value, Some("(*^_^*)"));
     }
 
     #[test]
     fn indirect_quote_handles_question_particle_followed_by_to() {
         let text = "スタッフ? と話し込み。";
         let view = TextView::new(text);
-        let spans =
-            build_spans_from_regex(&view, "BasicRule", Some("BasicRule"), &BASIC_RULE_REGEX);
+        let spans = find_basic_rule(&view);
         let target = spans
             .iter()
             .find(|span| span.start == 4 && span.end == 6)
@@ -892,5 +956,43 @@ mod tests {
         let output = segment_impl(text);
         let final_bounds = output.final_boundaries;
         assert_eq!(final_bounds, vec![12]);
+    }
+
+    #[test]
+    fn whitespace_class_matches_unicode_white_space() {
+        // Spot-check the 25 White_Space codepoints our scanners rely on.
+        let ws: &[char] = &[
+            '\u{0009}', '\u{000A}', '\u{000B}', '\u{000C}', '\u{000D}', '\u{0020}', '\u{0085}',
+            '\u{00A0}', '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}',
+            '\u{2005}', '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200A}', '\u{2028}',
+            '\u{2029}', '\u{202F}', '\u{205F}', '\u{3000}',
+        ];
+        for &ch in ws {
+            assert!(is_ws(ch), "expected {ch:?} to be whitespace");
+        }
+        assert!(!is_ws('a'));
+        assert!(!is_ws('。'));
+    }
+
+    #[test]
+    fn unify_keeps_first_of_duplicate_spans() {
+        let spans = vec![
+            SpanRecord {
+                rule_name: "BasicRule",
+                start: 0,
+                end: 3,
+                split_type: Some("BasicRule"),
+                split_value: Some("。"),
+            },
+            SpanRecord {
+                rule_name: "BasicRule",
+                start: 0,
+                end: 3,
+                split_type: Some("BasicRule"),
+                split_value: Some("。"),
+            },
+        ];
+        let unified = unify_span_annotations(spans);
+        assert_eq!(unified.len(), 1);
     }
 }

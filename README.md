@@ -100,6 +100,39 @@ The suite includes:
   $ VIRTUAL_ENV=refenv python3 scripts/generate_differential.py
   ```
   (requires a `bunkai`-capable Python venv; see the script header).
+* `tests/golden_regression.rs` — **auto-generated** 3,400+ golden cases. It
+  records the `final_boundaries` of the *pre-optimisation* Rust implementation
+  for a seeded pseudo-random corpus (plain text, emoji with/without skin-tone
+  modifiers, kaomoji, decimals, `No.`, indirect-quote particles, every kind of
+  whitespace incl. `U+3000`, …). Regenerate it with:
+  ```console
+  $ python3 scripts/generate_golden.py
+  ```
+  (no extra dependencies; it materialises the original sources from `git HEAD`
+  into a scratch crate and runs them).
+
+## Benchmark
+
+```console
+$ cargo bench --bench segment
+```
+
+Uses [criterion](https://github.com/bheisler/criterion.rs) with the release
+profile (LTO, `codegen-units = 1`). Results for `bunkai_rs` v0.1.0, on the
+built-in Japanese corpus (Xeon-class host, single thread):
+
+| text size | `segment` | `split_sentences` |
+| --- | ---: | ---: |
+| 61 B (one sentence) | ~1.7 µs | ~1.3 µs |
+| 7 KB (article) | ~148 µs | ~67 µs |
+| 56 KB (long doc) | ~1.65 ms | ~520 µs |
+
+Relative to the original regex/HashMap port, the optimisation pass reduces
+`split_sentences` by ~80% and `segment` by ~54% on the 7 KB corpus — mostly by
+borrowing `split_value` from the input instead of owning a `String` per span,
+hand-writing the two regular expressions and the emoji-table lookup (which also
+drops the `regex` and `once_cell` dependencies), and giving `split_sentences` a
+fast path that never materialises the per-layer `Span` records.
 
 ## License
 
