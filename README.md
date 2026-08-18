@@ -41,40 +41,6 @@ assert_eq!(seg.final_boundaries, vec![9, 11]);
 > it converts the boundaries back to byte offsets for you. To convert manually,
 > walk `text.char_indices()`.
 
-### As a CLI
-
-Reads UTF-8 text from stdin, prints one sentence per line:
-
-```console
-$ printf '宿を予約しました😄楽しみです★' | bunkai_rs
-宿を予約しました😄
-楽しみです★
-```
-
-Useful options:
-
-| Option | Effect |
-| --- | --- |
-| `-b, --boundaries` | Print the final char-offset boundaries, e.g. `7,13` |
-| `-l, --layers` | Print every pipeline layer (name + spans) for debugging |
-| `-h, --help` / `-V, --version` | Help / version |
-
-### As a Python extension (`--features python`)
-
-`cargo build --release --features python` produces a CPython extension that
-mirrors the Python reference's API:
-
-```python
-import _bunkai_rs as bunkai
-
-bunkai.split("宿を予約しました😄楽しみです★")
-# ['宿を予約しました😄', '楽しみです★']
-bunkai.segment("うーん🤔🤔🤔どうしよう")   # == Bunkai().find_eos(...)
-# [6, 11]
-```
-
-See [`src/python.rs`](src/python.rs) for build details (maturin / manual).
-
 ## How it works
 
 `bunkai_rs` is a direct port of bunkai's `BunkaiSentenceBoundaryDisambiguation`
