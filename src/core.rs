@@ -556,56 +556,55 @@ fn scan_all_with<E: Emit>(chars: &[char], out: &mut E) {
     let mut i = 0usize;
     while i < len {
         let ch = chars[i];
-        if ch == '(' || ch == '（' {
-            scan_emotion_word(chars, len, i, out);
-            scan_face_mark(chars, len, i, out);
-            i += 1;
-            continue;
-        }
-        if is_basic_punct(ch) {
-            if i == 0 || !is_basic_punct(chars[i - 1]) {
-                scan_basic_run(chars, len, i, out);
+        // Single dispatch instead of a chain of `if`s: the trigger classes are
+        // disjoint, so a jump table is both faster and keeps per-position
+        // output identical (verified by fused_scanner_reproduces_original_finders).
+        match ch {
+            '(' | '（' => {
+                scan_emotion_word(chars, len, i, out);
+                scan_face_mark(chars, len, i, out);
             }
-            i += 1;
-            continue;
-        }
-        if EMOTION_SYMBOLS.contains(&ch) {
-            if i == 0 || !EMOTION_SYMBOLS.contains(&chars[i - 1]) {
-                scan_emotion_symbol_run(chars, len, i, out);
+            // BasicRule punctuators.
+            '。' | '!' | '?' | '.' | '！' | '？' | '．' => {
+                if i == 0 || !is_basic_punct(chars[i - 1]) {
+                    scan_basic_run(chars, len, i, out);
+                }
             }
-            i += 1;
-            continue;
-        }
-        if emoji_lookup(ch as u32).is_some() {
-            if i == 0 || emoji_lookup(chars[i - 1] as u32).is_none() {
-                scan_emoji_run(chars, len, i, out);
+            // Emotion symbols (a maximal run, plus one trailing punctuator).
+            '…' | '★' | '☆' | '♪' => {
+                if i == 0 || !EMOTION_SYMBOLS.contains(&chars[i - 1]) {
+                    scan_emotion_symbol_run(chars, len, i, out);
+                }
             }
-            i += 1;
-            continue;
-        }
-        if is_ws(ch) {
-            // Linebreak detection, folded into the same pass: a whitespace run
-            // is visited at its start only, and recorded iff it contains a
-            // newline (the old separate `find_linebreaks` pass scanned every
-            // position again for this). This is independent of the basic-rule
-            // trailing-whitespace consumption in the original code, matching
-            // the two separate passes exactly.
-            if i == 0 || !is_ws(chars[i - 1]) {
-                let start = i;
-                let mut j = i;
-                let mut has_newline = false;
-                while j < len && is_ws(chars[j]) {
-                    if chars[j] == '\n' {
-                        has_newline = true;
+            _ => {
+                if emoji_lookup(ch as u32).is_some() {
+                    if i == 0 || emoji_lookup(chars[i - 1] as u32).is_none() {
+                        scan_emoji_run(chars, len, i, out);
                     }
-                    j += 1;
-                }
-                if has_newline {
-                    out.emit(Kind::Linebreak, start, j);
+                } else if is_ws(ch) {
+                    // Linebreak detection, folded into the same pass: a
+                    // whitespace run is visited at its start only, and recorded
+                    // iff it contains a newline (the old separate
+                    // `find_linebreaks` pass scanned every position again for
+                    // this). Independent of the basic-rule trailing-whitespace
+                    // consumption in the original code, matching the two
+                    // separate passes exactly.
+                    if i == 0 || !is_ws(chars[i - 1]) {
+                        let start = i;
+                        let mut j = i;
+                        let mut has_newline = false;
+                        while j < len && is_ws(chars[j]) {
+                            if chars[j] == '\n' {
+                                has_newline = true;
+                            }
+                            j += 1;
+                        }
+                        if has_newline {
+                            out.emit(Kind::Linebreak, start, j);
+                        }
+                    }
                 }
             }
-            i += 1;
-            continue;
         }
         i += 1;
     }
