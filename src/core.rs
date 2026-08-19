@@ -16,8 +16,7 @@
 /// * `unify_span_annotations` sorts and dedups in place instead of building a
 ///   `HashMap` keyed by a formatted string.
 use std::cell::OnceCell;
-use std::collections::{HashMap, HashSet};
-use std::hash::BuildHasherDefault;
+use std::collections::HashMap;
 
 use crate::emoji_data;
 
@@ -267,7 +266,13 @@ impl<'a> PipelineState<'a> {
     }
 
     fn add_forward_rule(&mut self, name: &'static str, spans: Vec<SpanRecord<'a>>) {
-        let filtered = filter_previous_rule_same_span(spans, self.final_spans());
+        // The end-of-text sentinel (layer 0), whose key a one-char rule span at
+        // the very last position can collide with — see filter_previous_rule_same_span.
+        let (sstart, send) = {
+            let s = &self.layers[0].spans[0];
+            (s.start, s.end)
+        };
+        let filtered = filter_previous_rule_same_span(spans, self.final_spans(), (sstart, send));
         self.add_layer(name, filtered);
     }
 
@@ -1058,13 +1063,18 @@ struct Bound {
     dot: bool,
 }
 
-/// Boundaries-only sink: merges each fused-scanner hit into the compact `Bound`
-/// list directly — no intermediate `SpanRecord`, no byte-map, no per-span
-/// `split_value`. Only the `"."` flag NumberException reads is kept, derived
-/// from the offsets the same way `split_value` used to be.
+/// Boundaries-only sink: pushes each fused-scanner hit straight onto the
+/// compact `Bound` list — no intermediate `SpanRecord`, no byte-map, no
+/// per-span `split_value`, and no membership set.
+///
+/// The first-wins-per-(start,end) dedup the layer path performs is not needed
+/// here: different rules never produce identical (start,end) (their trigger
+/// characters are disjoint), and the only possible collision — a one-char rule
+/// span at the very last position vs the end-of-text sentinel — resolves to the
+/// same boundary offset in the final sort+dedup, and every exception check
+/// returns false for `end == char_len`. So the merge is a plain append.
 struct BoundMerger<'a> {
     active: &'a mut Vec<Bound>,
-    seen: &'a mut FxSet<(usize, usize)>,
     chars: &'a [char],
     /// Newline whitespace runs, in scan order (linebreak spans).
     linebreaks: Vec<(usize, usize)>,
@@ -1076,12 +1086,10 @@ impl Emit for BoundMerger<'_> {
             self.linebreaks.push((start, end));
             return;
         }
-        if self.seen.insert((start, end)) {
-            // A span whose whole matched text is "." / "．" iff it spans exactly
-            // that single character — equivalent to `split_value == "."`/`"．"`.
-            let dot = end == start + 1 && matches!(self.chars[start], '.' | '．');
-            self.active.push(Bound { start, end, dot });
-        }
+        // A span whose whole matched text is "." / "．" iff it spans exactly
+        // that single character — equivalent to `split_value == "."`/`"．"`.
+        let dot = end == start + 1 && matches!(self.chars[start], '.' | '．');
+        self.active.push(Bound { start, end, dot });
     }
 }
 
@@ -1105,14 +1113,14 @@ pub(crate) fn segment_bounds_only(text: &str) -> Vec<usize> {
     };
 
     let mut active: Vec<Bound> = Vec::new();
-    let mut seen: FxSet<(usize, usize)> = FxSet::default();
-    seen.insert((sentinel.start, sentinel.end));
+    // The sentinel guarantees the end-of-text boundary; pushed first but, with
+    // no dedup set, a one-char rule span at the very last position may also
+    // land here — the final {sort,dedup} of `ends` collapses them.
     active.push(sentinel);
 
     let linebreaks = {
         let mut merger = BoundMerger {
             active: &mut active,
-            seen: &mut seen,
             chars: &view.chars,
             linebreaks: Vec::new(),
         };
@@ -1165,70 +1173,34 @@ fn apply_linebreak_force_bounds(
     result
 }
 
+/// Merge a fresh rule's spans into the cumulative layer, keeping one record per
+/// (start,end) and the earlier rule winning.
+///
+/// No general membership structure is needed: the four annotators' trigger
+/// characters (`(`/`（`, the basic punctuators, `…★☆♪` and the emoji block) are
+/// disjoint, so two different rules can never produce the same (start,end). The
+/// only key a fresh span can collide with is the end-of-text sentinel — a
+/// one-char rule span at the very last position occupies `(len-1, len)` — so
+/// first-wins is exactly "skip spans occupying the sentinel's key". Fresh
+/// spans from one rule are also internally unique, so the layer stays
+/// byte-identical to the old full-sweep set-based version (guarded by the
+/// golden/differential suites and the fast-bunkai cross-check).
 fn filter_previous_rule_same_span<'a>(
     current: Vec<SpanRecord<'a>>,
     previous: &[SpanRecord<'a>],
+    sentinel_key: (usize, usize),
 ) -> Vec<SpanRecord<'a>> {
-    let prev_keys: FxSet<(usize, usize)> =
-        previous.iter().map(|span| (span.start, span.end)).collect();
-    let mut seen: FxSet<(usize, usize)> = FxSet::default();
-
     let mut filtered: Vec<SpanRecord<'_>> = Vec::with_capacity(current.len() + previous.len());
     for span in current {
-        let key = (span.start, span.end);
-        if prev_keys.contains(&key) {
+        if (span.start, span.end) == sentinel_key {
             continue;
         }
-        if seen.insert(key) {
-            filtered.push(span);
-        }
+        filtered.push(span);
     }
 
     filtered.extend(previous.iter().cloned());
     filtered
 }
-
-/// A fast, deterministic FxHash-style integer hasher. Used only for the hot
-/// membership `HashSet`s keyed by `(start, end)` offsets — which are never
-/// iterated — so the choice of hasher cannot affect any public output. The
-/// linebreak `HashMap`s, whose iteration order feeds the layer output, keep the
-/// default SipHash.
-#[derive(Clone, Default)]
-struct FxHasher(usize);
-
-const FX_K: usize = 0x517cc1b727220a95;
-
-impl std::hash::Hasher for FxHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0 as u64
-    }
-
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_u8(b);
-        }
-    }
-
-    #[inline]
-    fn write_u8(&mut self, i: u8) {
-        self.0 = (self.0.rotate_left(5) ^ i as usize).wrapping_mul(FX_K);
-    }
-
-    #[inline]
-    fn write_u64(&mut self, i: u64) {
-        self.0 = (self.0.rotate_left(5) ^ i as usize).wrapping_mul(FX_K);
-    }
-
-    #[inline]
-    fn write_usize(&mut self, i: usize) {
-        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(FX_K);
-    }
-}
-
-/// A `HashSet` with the fast hasher above.
-type FxSet<K> = HashSet<K, BuildHasherDefault<FxHasher>>;
 
 /// A single annotated span produced by one of the pipeline rules.
 ///
