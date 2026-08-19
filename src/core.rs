@@ -214,7 +214,7 @@ fn is_ws(ch: char) -> bool {
     )
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SpanRecord<'a> {
     pub(crate) rule_name: &'static str,
     pub(crate) start: usize,
@@ -349,14 +349,6 @@ impl<'a> TextView<'a> {
     }
 }
 
-#[derive(Clone)]
-struct EmojiSpan {
-    start: usize,
-    end: usize,
-    /// Whether any character in the run belongs to a target category.
-    any_target: bool,
-}
-
 fn is_in_ranges(ch: char, ranges: &[(char, char)]) -> bool {
     ranges.iter().any(|&(start, end)| start <= ch && ch <= end)
 }
@@ -444,127 +436,238 @@ fn emoji_lookup(codepoint: u32) -> Option<&'static Option<&'static str>> {
 }
 const _: () = assert!(EMOJI_LOW_END == EMOJI_HIGH_START);
 
-fn find_face_marks<'a>(view: &TextView<'a>) -> Vec<SpanRecord<'a>> {
-    let mut spans: Vec<SpanRecord<'_>> = Vec::new();
-    let len = view.char_len();
-    let mut idx = 0usize;
-
-    while idx < len {
-        let ch = view.char_at(idx).unwrap_or('\0');
-        if ch != '(' && ch != '（' {
-            idx += 1;
-            continue;
-        }
-
-        let mut cursor = idx + 1;
-        let mut has_symbol2 = false;
-        while cursor < len {
-            let current = view.char_at(cursor).unwrap_or('\0');
-            if !is_face_symbol1(current) {
-                break;
-            }
-            if is_face_symbol2(current) {
-                has_symbol2 = true;
-            }
-            cursor += 1;
-        }
-        if !has_symbol2 {
-            idx += 1;
-            continue;
-        }
-        if cursor >= len {
-            idx += 1;
-            continue;
-        }
-        let closing = view.char_at(cursor).unwrap_or('\0');
-        if closing != ')' && closing != '）' {
-            idx += 1;
-            continue;
-        }
-        let mut end = cursor + 1;
-        while end < len && is_face_symbol_prefix_suffix(view.char_at(end).unwrap_or('\0')) {
-            end += 1;
-        }
-        let mut start = idx;
-        while start > 0 && is_face_symbol_prefix_suffix(view.char_at(start - 1).unwrap_or('\0')) {
-            start -= 1;
-        }
-
-        spans.push(SpanRecord {
-            rule_name: "FaceMarkDetector",
-            start,
-            end,
-            split_type: Some("facemark"),
-            split_value: Some(view.slice(start, end)),
-        });
-        idx = end;
-    }
-
-    spans
+/// Result of the single-pass candidate scanner: every span the four
+/// annotators (FaceMark/Emotion/Emoji/BasicRule) would find, grouped per rule
+/// so the pipeline can merge them in the canonical rule order.
+struct ScanAll<'a> {
+    face: Vec<SpanRecord<'a>>,
+    emotion: Vec<SpanRecord<'a>>,
+    emoji: Vec<SpanRecord<'a>>,
+    basic: Vec<SpanRecord<'a>>,
 }
 
-fn find_emotion_expressions<'a>(view: &TextView<'a>) -> Vec<SpanRecord<'a>> {
-    let mut spans: Vec<SpanRecord<'_>> = Vec::new();
-    let len = view.char_len();
+/// Fused scanner: find FaceMark, EmotionExpression (words + symbols), Emoji and
+/// BasicRule candidates in ONE pass over the character buffer, instead of
+/// re-walking the whole text once per annotator.
+///
+/// It deliberately does *not* consume matched regions (other than the forward
+/// scans inside each per-rule extractor): each position is classified once, a
+/// rule only fires at the *start* of its run (`i == 0` or the previous char not
+/// in that rule's trigger class), which mirrors exactly what the original
+/// consuming finders produced — one span per maximal punct / symbol / emoji /
+/// whitespace run, face marks and emotion words detected at every '(' / '（'.
+/// Because the extractors are the original loops verbatim, per-position output
+/// is byte-for-byte identical to the four separate finders.
+fn scan_all<'a>(view: &TextView<'a>) -> ScanAll<'a> {
+    let chars = &view.chars;
+    let len = chars.len();
+    let mut out = ScanAll {
+        face: Vec::new(),
+        emotion: Vec::new(),
+        emoji: Vec::new(),
+        basic: Vec::new(),
+    };
 
-    for idx in 0..len {
-        let ch = view.char_at(idx).unwrap_or('\0');
-        if ch != '(' && ch != '（' {
+    let mut i = 0usize;
+    while i < len {
+        let ch = chars[i];
+        if ch == '(' || ch == '（' {
+            scan_emotion_word(view, chars, len, i, &mut out.emotion);
+            scan_face_mark(view, chars, len, i, &mut out.face);
+            i += 1;
             continue;
         }
-        for word in EMOTION_WORDS {
-            let word_len = word.chars().count();
-            let start_word = idx + 1;
-            let end_word = start_word + word_len;
-            if end_word >= len {
-                continue;
+        if is_basic_punct(ch) {
+            if i == 0 || !is_basic_punct(chars[i - 1]) {
+                scan_basic_run(view, chars, len, i, &mut out.basic);
             }
-            if view.slice(start_word, end_word) == *word {
-                let closing = view.char_at(end_word).unwrap_or('\0');
-                if closing == ')' || closing == '）' {
-                    let end = end_word + 1;
-                    spans.push(SpanRecord {
-                        rule_name: "EmotionExpressionAnnotator",
-                        start: idx,
-                        end,
-                        split_type: Some("EmotionExpressionAnnotator"),
-                        split_value: Some(view.slice(idx, end)),
-                    });
-                    break;
-                }
+            i += 1;
+            continue;
+        }
+        if EMOTION_SYMBOLS.contains(&ch) {
+            if i == 0 || !EMOTION_SYMBOLS.contains(&chars[i - 1]) {
+                scan_emotion_symbol_run(view, chars, len, i, &mut out.emotion);
+            }
+            i += 1;
+            continue;
+        }
+        if emoji_lookup(ch as u32).is_some() {
+            if i == 0 || emoji_lookup(chars[i - 1] as u32).is_none() {
+                scan_emoji_run(view, chars, len, i, &mut out.emoji);
+            }
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+
+    out
+}
+
+/// FaceMarkDetector: a kaomoji `(...)` whose body contains at least one
+/// face-symbol character, optionally extended by trailing/leading face-symbol
+/// chars (e.g. `o(^_^)o`).
+fn scan_face_mark<'a>(
+    view: &TextView<'a>,
+    chars: &[char],
+    len: usize,
+    i: usize,
+    out: &mut Vec<SpanRecord<'a>>,
+) {
+    let mut cursor = i + 1;
+    let mut has_symbol2 = false;
+    while cursor < len {
+        let current = chars[cursor];
+        if !is_face_symbol1(current) {
+            break;
+        }
+        if is_face_symbol2(current) {
+            has_symbol2 = true;
+        }
+        cursor += 1;
+    }
+    if !has_symbol2 || cursor >= len {
+        return;
+    }
+    let closing = chars[cursor];
+    if closing != ')' && closing != '）' {
+        return;
+    }
+    let mut end = cursor + 1;
+    while end < len && is_face_symbol_prefix_suffix(chars[end]) {
+        end += 1;
+    }
+    let mut start = i;
+    while start > 0 && is_face_symbol_prefix_suffix(chars[start - 1]) {
+        start -= 1;
+    }
+
+    out.push(SpanRecord {
+        rule_name: "FaceMarkDetector",
+        start,
+        end,
+        split_type: Some("facemark"),
+        split_value: Some(view.slice(start, end)),
+    });
+}
+
+/// EmotionExpressionAnnotator — `(word)` form, e.g. `(笑)` / `（泣）`.
+fn scan_emotion_word<'a>(
+    view: &TextView<'a>,
+    chars: &[char],
+    len: usize,
+    i: usize,
+    out: &mut Vec<SpanRecord<'a>>,
+) {
+    for word in EMOTION_WORDS {
+        let word_len = word.chars().count();
+        let end_word = i + 1 + word_len;
+        if end_word >= len {
+            continue;
+        }
+        if view.slice(i + 1, end_word) == *word {
+            let closing = chars[end_word];
+            if closing == ')' || closing == '）' {
+                let end = end_word + 1;
+                out.push(SpanRecord {
+                    rule_name: "EmotionExpressionAnnotator",
+                    start: i,
+                    end,
+                    split_type: Some("EmotionExpressionAnnotator"),
+                    split_value: Some(view.slice(i, end)),
+                });
+                break;
             }
         }
     }
+}
 
-    let mut idx = 0usize;
-    while idx < len {
-        let ch = view.char_at(idx).unwrap_or('\0');
-        if !EMOTION_SYMBOLS.contains(&ch) {
-            idx += 1;
-            continue;
+/// EmotionExpressionAnnotator — symbol form: a maximal run of `…★☆♪` plus (if
+/// present) exactly one following punctuator.
+fn scan_emotion_symbol_run<'a>(
+    view: &TextView<'a>,
+    chars: &[char],
+    len: usize,
+    i: usize,
+    out: &mut Vec<SpanRecord<'a>>,
+) {
+    let start = i;
+    let mut j = i;
+    while j < len && EMOTION_SYMBOLS.contains(&chars[j]) {
+        j += 1;
+    }
+    let mut end = j;
+    if j < len && EMOTION_PUNCTUATION.contains(&chars[j]) {
+        end += 1;
+    }
+    out.push(SpanRecord {
+        rule_name: "EmotionExpressionAnnotator",
+        start,
+        end,
+        split_type: Some("EmotionExpressionAnnotator"),
+        split_value: Some(view.slice(start, end)),
+    });
+}
+
+/// EmojiAnnotator: a maximal run of emoji codepoints that contains at least one
+/// char in a target category (`Smileys & Emotion` or `Symbols`).
+fn scan_emoji_run<'a>(
+    view: &TextView<'a>,
+    chars: &[char],
+    len: usize,
+    i: usize,
+    out: &mut Vec<SpanRecord<'a>>,
+) {
+    let start = i;
+    let mut j = i;
+    let mut any_target = emoji_lookup(chars[j] as u32)
+        .copied()
+        .flatten()
+        .is_some_and(|cat| TARGET_EMOJI_CATEGORIES.contains(&cat));
+    j += 1;
+    while j < len {
+        let Some(category) = emoji_lookup(chars[j] as u32).copied() else {
+            break;
+        };
+        if category.is_some_and(|cat| TARGET_EMOJI_CATEGORIES.contains(&cat)) {
+            any_target = true;
         }
-        let start = idx;
-        while idx < len && EMOTION_SYMBOLS.contains(&view.char_at(idx).unwrap_or('\0')) {
-            idx += 1;
-        }
-        let mut end = idx;
-        if idx < len {
-            let next = view.char_at(idx).unwrap_or('\0');
-            if EMOTION_PUNCTUATION.contains(&next) {
-                idx += 1;
-                end += 1;
-            }
-        }
-        spans.push(SpanRecord {
-            rule_name: "EmotionExpressionAnnotator",
+        j += 1;
+    }
+    if any_target {
+        out.push(SpanRecord {
+            rule_name: "EmojiAnnotator",
             start,
-            end,
-            split_type: Some("EmotionExpressionAnnotator"),
-            split_value: Some(view.slice(start, end)),
+            end: j,
+            split_type: Some("EmojiAnnotator"),
+            split_value: Some(view.slice(start, j)),
         });
     }
+}
 
-    unify_span_annotations(spans)
+/// BasicRule: the naive punctuators `[。!?.！？．]+` plus any trailing whitespace.
+fn scan_basic_run<'a>(
+    view: &TextView<'a>,
+    chars: &[char],
+    len: usize,
+    i: usize,
+    out: &mut Vec<SpanRecord<'a>>,
+) {
+    let start = i;
+    let mut j = i;
+    while j < len && is_basic_punct(chars[j]) {
+        j += 1;
+    }
+    while j < len && is_ws(chars[j]) {
+        j += 1;
+    }
+    out.push(SpanRecord {
+        rule_name: "BasicRule",
+        start,
+        end: j,
+        split_type: Some("BasicRule"),
+        split_value: Some(view.slice(start, j)),
+    });
 }
 
 pub(crate) fn segment_impl(text: &str) -> PipelineOutput<'_> {
@@ -574,23 +677,31 @@ pub(crate) fn segment_impl(text: &str) -> PipelineOutput<'_> {
     let mut state = PipelineState::new(view.char_len());
     prof::end();
 
+    prof::begin("scan_all");
+    let scan = scan_all(&view);
+    prof::end();
+
     prof::begin("FaceMarkDetector");
-    let face_spans = find_face_marks(&view);
+    let face_spans = scan.face;
     state.add_forward_rule("FaceMarkDetector", face_spans);
     prof::end();
 
     prof::begin("EmotionExpressionAnnotator");
-    let emotion_spans = find_emotion_expressions(&view);
+    // The fused scanner emits word/symbol emotions interleaved by position;
+    // the original finder produced them in word-then-symbol order. The rule
+    // keeps this exact order in its layer, so reapply the original unification
+    // (sort + dedup) to reproduce the byte-identical EmotionExpression layer.
+    let emotion_spans = unify_span_annotations(scan.emotion);
     state.add_forward_rule("EmotionExpressionAnnotator", emotion_spans);
     prof::end();
 
     prof::begin("EmojiAnnotator");
-    let emoji_spans = build_emoji_spans(&view);
+    let emoji_spans = scan.emoji;
     state.add_forward_rule("EmojiAnnotator", emoji_spans);
     prof::end();
 
     prof::begin("BasicRule");
-    let basic_rule_spans = find_basic_rule(&view);
+    let basic_rule_spans = scan.basic;
     state.add_forward_rule("BasicRule", basic_rule_spans);
     prof::end();
 
@@ -612,84 +723,6 @@ pub(crate) fn segment_impl(text: &str) -> PipelineOutput<'_> {
     prof::end();
     prof::on_impl_done(prof_base);
     out
-}
-
-/// Hand-written equivalent of the old `[。!?.！？．]+\s*` regex: a maximal run
-/// of basic punctuators, then any run of Unicode whitespace.
-fn find_basic_rule<'a>(view: &TextView<'a>) -> Vec<SpanRecord<'a>> {
-    let mut spans: Vec<SpanRecord<'_>> = Vec::new();
-    let len = view.char_len();
-    let mut i = 0usize;
-    while i < len {
-        if !is_basic_punct(view.char_at(i).unwrap_or('\0')) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < len && is_basic_punct(view.char_at(i).unwrap_or('\0')) {
-            i += 1;
-        }
-        while i < len && is_ws(view.char_at(i).unwrap_or('\0')) {
-            i += 1;
-        }
-        let end = i;
-        spans.push(SpanRecord {
-            rule_name: "BasicRule",
-            start,
-            end,
-            split_type: Some("BasicRule"),
-            split_value: Some(view.slice(start, end)),
-        });
-    }
-    spans
-}
-
-fn build_emoji_spans<'a>(view: &TextView<'a>) -> Vec<SpanRecord<'a>> {
-    let spans = find_emoji_spans(view);
-    spans
-        .into_iter()
-        .filter(|span| span.end > span.start && span.any_target)
-        .map(|span| SpanRecord {
-            rule_name: "EmojiAnnotator",
-            start: span.start,
-            end: span.end,
-            split_type: Some("EmojiAnnotator"),
-            split_value: Some(view.slice(span.start, span.end)),
-        })
-        .collect()
-}
-
-fn find_emoji_spans(view: &TextView<'_>) -> Vec<EmojiSpan> {
-    let mut spans: Vec<EmojiSpan> = Vec::new();
-    let len = view.char_len();
-    let mut i = 0usize;
-    while i < len {
-        // Skip plain characters; a run starts on an emoji codepoint. Table
-        // membership is what matters — "emoji" includes codepoints whose
-        // stored category is `None`, e.g. skin-tone modifiers.
-        let Some(first) = emoji_lookup(view.chars[i] as u32).copied() else {
-            i += 1;
-            continue;
-        };
-        let start = i;
-        let mut any_target = first.is_some_and(|cat| TARGET_EMOJI_CATEGORIES.contains(&cat));
-        i += 1;
-        while i < len {
-            let Some(category) = emoji_lookup(view.chars[i] as u32).copied() else {
-                break;
-            };
-            if category.is_some_and(|cat| TARGET_EMOJI_CATEGORIES.contains(&cat)) {
-                any_target = true;
-            }
-            i += 1;
-        }
-        spans.push(EmojiSpan {
-            start,
-            end: i,
-            any_target,
-        });
-    }
-    spans
 }
 
 fn apply_indirect_quote<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) {
@@ -1016,16 +1049,17 @@ pub(crate) fn segment_bounds_only(text: &str) -> Vec<usize> {
     seen.insert((sentinel.start, sentinel.end));
     active.push(sentinel);
 
-    for sr in find_face_marks(&view) {
+    let scan = scan_all(&view);
+    for sr in scan.face {
         merge_bound(&mut active, &mut seen, sr);
     }
-    for sr in find_emotion_expressions(&view) {
+    for sr in scan.emotion {
         merge_bound(&mut active, &mut seen, sr);
     }
-    for sr in build_emoji_spans(&view) {
+    for sr in scan.emoji {
         merge_bound(&mut active, &mut seen, sr);
     }
-    for sr in find_basic_rule(&view) {
+    for sr in scan.basic {
         merge_bound(&mut active, &mut seen, sr);
     }
 
@@ -1238,7 +1272,7 @@ mod tests {
     fn face_mark_detection_matches_reference() {
         let text = "顔文字(*^_^*)だよ。";
         let view = TextView::new(text);
-        let spans = find_face_marks(&view);
+        let spans = scan_all(&view).face;
         assert_eq!(spans.len(), 1);
         let span = &spans[0];
         assert_eq!(span.start, 3);
@@ -1250,7 +1284,7 @@ mod tests {
     fn indirect_quote_handles_question_particle_followed_by_to() {
         let text = "スタッフ? と話し込み。";
         let view = TextView::new(text);
-        let spans = find_basic_rule(&view);
+        let spans = scan_all(&view).basic;
         let target = spans
             .iter()
             .find(|span| span.start == 4 && span.end == 6)
@@ -1451,6 +1485,338 @@ mod tests {
                 text.chars().count(),
                 "split_sentences lost/duplicated chars at case #{i}: {text:?}"
             );
+        }
+    }
+
+    // ---- pre-fusion finder equivalence (guards the single-pass scanner) ----
+    #[derive(Clone)]
+    struct OldEmojiSpan {
+        start: usize,
+        end: usize,
+        any_target: bool,
+    }
+
+    fn old_find_face_marks<'a>(view: &TextView<'a>) -> Vec<SpanRecord<'a>> {
+        let mut spans: Vec<SpanRecord<'_>> = Vec::new();
+        let len = view.char_len();
+        let mut idx = 0usize;
+
+        while idx < len {
+            let ch = view.char_at(idx).unwrap_or('\0');
+            if ch != '(' && ch != '（' {
+                idx += 1;
+                continue;
+            }
+
+            let mut cursor = idx + 1;
+            let mut has_symbol2 = false;
+            while cursor < len {
+                let current = view.char_at(cursor).unwrap_or('\0');
+                if !is_face_symbol1(current) {
+                    break;
+                }
+                if is_face_symbol2(current) {
+                    has_symbol2 = true;
+                }
+                cursor += 1;
+            }
+            if !has_symbol2 {
+                idx += 1;
+                continue;
+            }
+            if cursor >= len {
+                idx += 1;
+                continue;
+            }
+            let closing = view.char_at(cursor).unwrap_or('\0');
+            if closing != ')' && closing != '）' {
+                idx += 1;
+                continue;
+            }
+            let mut end = cursor + 1;
+            while end < len && is_face_symbol_prefix_suffix(view.char_at(end).unwrap_or('\0')) {
+                end += 1;
+            }
+            let mut start = idx;
+            while start > 0 && is_face_symbol_prefix_suffix(view.char_at(start - 1).unwrap_or('\0'))
+            {
+                start -= 1;
+            }
+
+            spans.push(SpanRecord {
+                rule_name: "FaceMarkDetector",
+                start,
+                end,
+                split_type: Some("facemark"),
+                split_value: Some(view.slice(start, end)),
+            });
+            idx = end;
+        }
+
+        spans
+    }
+
+    fn old_find_emotion_expressions<'a>(view: &TextView<'a>) -> Vec<SpanRecord<'a>> {
+        let mut spans: Vec<SpanRecord<'_>> = Vec::new();
+        let len = view.char_len();
+
+        for idx in 0..len {
+            let ch = view.char_at(idx).unwrap_or('\0');
+            if ch != '(' && ch != '（' {
+                continue;
+            }
+            for word in EMOTION_WORDS {
+                let word_len = word.chars().count();
+                let start_word = idx + 1;
+                let end_word = start_word + word_len;
+                if end_word >= len {
+                    continue;
+                }
+                if view.slice(start_word, end_word) == *word {
+                    let closing = view.char_at(end_word).unwrap_or('\0');
+                    if closing == ')' || closing == '）' {
+                        let end = end_word + 1;
+                        spans.push(SpanRecord {
+                            rule_name: "EmotionExpressionAnnotator",
+                            start: idx,
+                            end,
+                            split_type: Some("EmotionExpressionAnnotator"),
+                            split_value: Some(view.slice(idx, end)),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut idx = 0usize;
+        while idx < len {
+            let ch = view.char_at(idx).unwrap_or('\0');
+            if !EMOTION_SYMBOLS.contains(&ch) {
+                idx += 1;
+                continue;
+            }
+            let start = idx;
+            while idx < len && EMOTION_SYMBOLS.contains(&view.char_at(idx).unwrap_or('\0')) {
+                idx += 1;
+            }
+            let mut end = idx;
+            if idx < len {
+                let next = view.char_at(idx).unwrap_or('\0');
+                if EMOTION_PUNCTUATION.contains(&next) {
+                    idx += 1;
+                    end += 1;
+                }
+            }
+            spans.push(SpanRecord {
+                rule_name: "EmotionExpressionAnnotator",
+                start,
+                end,
+                split_type: Some("EmotionExpressionAnnotator"),
+                split_value: Some(view.slice(start, end)),
+            });
+        }
+
+        unify_span_annotations(spans)
+    }
+
+    fn old_find_basic_rule<'a>(view: &TextView<'a>) -> Vec<SpanRecord<'a>> {
+        let mut spans: Vec<SpanRecord<'_>> = Vec::new();
+        let len = view.char_len();
+        let mut i = 0usize;
+        while i < len {
+            if !is_basic_punct(view.char_at(i).unwrap_or('\0')) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < len && is_basic_punct(view.char_at(i).unwrap_or('\0')) {
+                i += 1;
+            }
+            while i < len && is_ws(view.char_at(i).unwrap_or('\0')) {
+                i += 1;
+            }
+            let end = i;
+            spans.push(SpanRecord {
+                rule_name: "BasicRule",
+                start,
+                end,
+                split_type: Some("BasicRule"),
+                split_value: Some(view.slice(start, end)),
+            });
+        }
+        spans
+    }
+
+    fn old_build_emoji_spans<'a>(view: &TextView<'a>) -> Vec<SpanRecord<'a>> {
+        let spans = old_find_emoji_spans(view);
+        spans
+            .into_iter()
+            .filter(|span| span.end > span.start && span.any_target)
+            .map(|span| SpanRecord {
+                rule_name: "EmojiAnnotator",
+                start: span.start,
+                end: span.end,
+                split_type: Some("EmojiAnnotator"),
+                split_value: Some(view.slice(span.start, span.end)),
+            })
+            .collect()
+    }
+
+    fn old_find_emoji_spans(view: &TextView<'_>) -> Vec<OldEmojiSpan> {
+        let mut spans: Vec<OldEmojiSpan> = Vec::new();
+        let len = view.char_len();
+        let mut i = 0usize;
+        while i < len {
+            // Skip plain characters; a run starts on an emoji codepoint. Table
+            // membership is what matters — "emoji" includes codepoints whose
+            // stored category is `None`, e.g. skin-tone modifiers.
+            let Some(first) = emoji_lookup(view.chars[i] as u32).copied() else {
+                i += 1;
+                continue;
+            };
+            let start = i;
+            let mut any_target = first.is_some_and(|cat| TARGET_EMOJI_CATEGORIES.contains(&cat));
+            i += 1;
+            while i < len {
+                let Some(category) = emoji_lookup(view.chars[i] as u32).copied() else {
+                    break;
+                };
+                if category.is_some_and(|cat| TARGET_EMOJI_CATEGORIES.contains(&cat)) {
+                    any_target = true;
+                }
+                i += 1;
+            }
+            spans.push(OldEmojiSpan {
+                start,
+                end: i,
+                any_target,
+            });
+        }
+        spans
+    }
+
+    #[test]
+    fn fused_scanner_reproduces_original_finders() {
+        // The original per-rule finders returned spans in a fixed per-rule
+        // order (face marks, emotion words+symbols, emoji runs, basic runs).
+        // The fused single-pass scan_all must reproduce each rule's span list
+        // *exactly* (values AND order) so the layer output stays identical.
+        const BITS: &[&str] = &[
+            "日本語文章文字境界判定のための手順検証を行う",
+            "あいうえおかきくけこ",
+            "abcXYZ0123456789",
+            "まだ2ヶ月も先だけど。",
+            "早すぎかな(笑)",
+            "楽しみです★",
+            "。",
+            "！",
+            "？",
+            "．",
+            "!",
+            "?",
+            "。。",
+            "!?",
+            "なのかな？",
+            "(笑)",
+            "(泣)",
+            "(汗)",
+            "…",
+            "★",
+            "☆",
+            "♪",
+            "…!",
+            "(^_^)",
+            "(*´∀｀*)",
+            "＼(^o^)／",
+            "(^-^)",
+            "(^^)",
+            "(。・ω・。)",
+            "(｀・ω・´)",
+            "😀",
+            "😄",
+            "👍",
+            "🎉",
+            "❤️",
+            "😀😀😀",
+            "👍🏽",
+            "👩\u{1F3FC}",
+            "🍺",
+            "🍣",
+            "3.5",
+            "3．5",
+            "No.1",
+            "4.5点",
+            "email@example.comは。",
+            "? と",
+            "？って",
+            "。という",
+            "？に",
+            "など",
+            "? くらいでした",
+            "？ もあり",
+            "\n",
+            "\n\n",
+            " \n ",
+            "\n\u{3000}\n",
+            "\u{3000}\n",
+            "\u{00A0}",
+            "(",
+            ")",
+            "（",
+            "）",
+            "「」",
+            "スタッフ? と話し込み。",
+            "この値段で、こんな夕飯いいの？\nって、くらいおいしかった！",
+            "宿を予約しました😄まだ2ヶ月も先だけど。",
+            "(近日中には冷房に切り替わる予定です。\nいいですね(泣))",
+            "30代の夫婦2組(男2.女2)です。",
+            "うーん🤔🤔🤔どうしよう",
+        ];
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                z ^ (z >> 31)
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % n as u64) as usize
+            }
+        }
+        let mut rng = Rng(0xF005BA11);
+        let mut cases: Vec<String> = Vec::with_capacity(BITS.len() * BITS.len() + 5000);
+        for _ in 0..5000 {
+            let mut s = String::new();
+            let len = rng.below(10) + 1;
+            for _ in 0..len {
+                s.push_str(BITS[rng.below(BITS.len())]);
+                if rng.below(4) == 0 {
+                    s.push_str(BITS[rng.below(BITS.len())]);
+                }
+            }
+            cases.push(s);
+        }
+        for a in BITS {
+            for b in BITS {
+                cases.push(format!("{a}{b}"));
+            }
+        }
+        cases.extend(BITS.iter().map(|s| s.to_string()));
+
+        for (i, text) in cases.iter().enumerate() {
+            let view = TextView::new(text);
+            let scan = scan_all(&view);
+            let old_face = old_find_face_marks(&view);
+            let old_emotion = old_find_emotion_expressions(&view);
+            let old_emoji = old_build_emoji_spans(&view);
+            let old_basic = old_find_basic_rule(&view);
+            assert_eq!(scan.face, old_face, "case {i} face: {text:?}");
+            assert_eq!(scan.emotion, old_emotion, "case {i} emotion: {text:?}");
+            assert_eq!(scan.emoji, old_emoji, "case {i} emoji: {text:?}");
+            assert_eq!(scan.basic, old_basic, "case {i} basic: {text:?}");
         }
     }
 }
