@@ -15,6 +15,7 @@
 ///   that is binary-searched instead of being built into a `HashMap`.
 /// * `unify_span_annotations` sorts and dedups in place instead of building a
 ///   `HashMap` keyed by a formatted string.
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::emoji_data;
@@ -291,24 +292,19 @@ pub(crate) struct PipelineOutput<'a> {
 pub(crate) struct TextView<'a> {
     text: &'a str,
     chars: Vec<char>,
-    char_to_byte: Vec<usize>,
+    /// char index → byte offset. Built lazily on first `slice` (only the
+    /// layer-producing path needs it); the boundaries-only path never touches
+    /// it, so we skip the whole `Vec<usize>` allocation for `split_sentences`.
+    char_to_byte: OnceCell<Vec<usize>>,
 }
 
 impl<'a> TextView<'a> {
     pub(crate) fn new(text: &'a str) -> Self {
         let chars: Vec<char> = text.chars().collect();
-        // Build byte offsets in a second pass over the (cheap) char Vec rather
-        // than re-decoding UTF-8 bytes.
-        let mut char_to_byte = Vec::with_capacity(chars.len() + 1);
-        let mut byte = 0usize;
-        for ch in &chars {
-            char_to_byte.push(byte);
-            byte += ch.len_utf8();
-        }
         Self {
             text,
             chars,
-            char_to_byte,
+            char_to_byte: OnceCell::new(),
         }
     }
 
@@ -321,13 +317,25 @@ impl<'a> TextView<'a> {
         self.chars.get(index).copied()
     }
 
-    /// Byte offset of a character index, clamped to `text.len()`.
+    /// Byte offset of a character index, clamped to `text.len()`; materialising
+    /// the char→byte map on first use.
     #[inline]
     fn byte_at(&self, index: usize) -> usize {
-        if index >= self.char_to_byte.len() {
+        let map = self.char_to_byte.get_or_init(|| {
+            // Build byte offsets in a single pass over the (cheap) char Vec
+            // rather than re-decoding UTF-8 bytes.
+            let mut v = Vec::with_capacity(self.chars.len() + 1);
+            let mut byte = 0usize;
+            for ch in &self.chars {
+                v.push(byte);
+                byte += ch.len_utf8();
+            }
+            v
+        });
+        if index >= map.len() {
             self.text.len()
         } else {
-            self.char_to_byte[index]
+            map[index]
         }
     }
 
@@ -335,17 +343,6 @@ impl<'a> TextView<'a> {
         let start_byte = self.byte_at(start);
         let end_byte = self.byte_at(end);
         &self.text[start_byte..end_byte]
-    }
-
-    /// Byte-wise `starts_with` at a character index. `index` must be a char
-    /// boundary (it always is: every caller hands it a previously decoded
-    /// character index).
-    #[inline]
-    fn starts_with(&self, index: usize, pattern: &str) -> bool {
-        let Some(&start_byte) = self.char_to_byte.get(index) else {
-            return false;
-        };
-        self.text[start_byte..].starts_with(pattern)
     }
 }
 
@@ -439,11 +436,93 @@ const _: () = assert!(EMOJI_LOW_END == EMOJI_HIGH_START);
 /// Result of the single-pass candidate scanner: every span the four
 /// annotators (FaceMark/Emotion/Emoji/BasicRule) would find, grouped per rule
 /// so the pipeline can merge them in the canonical rule order.
+/// Rule kind for the fused scanner — routes a hit to the right sink and carries
+/// the per-rule annotation strings.
+#[derive(Clone, Copy)]
+enum Kind {
+    Face,
+    Emotion,
+    Emoji,
+    Basic,
+}
+
+impl Kind {
+    fn rule_name(self) -> &'static str {
+        match self {
+            Kind::Face => "FaceMarkDetector",
+            Kind::Emotion => "EmotionExpressionAnnotator",
+            Kind::Emoji => "EmojiAnnotator",
+            Kind::Basic => "BasicRule",
+        }
+    }
+
+    fn split_type(self) -> &'static str {
+        match self {
+            Kind::Face => "facemark",
+            other => other.rule_name(),
+        }
+    }
+}
+
+/// Sink for fused-scanner hits. The layer path materialises full `SpanRecord`s
+/// (including each `split_value` slice, via the lazily built char→byte map); the
+/// boundaries-only path merges straight into the compact `Bound` list, keeping
+/// only the offsets Number/Dot exceptions read plus a `"."`-equals flag — so
+/// `split_sentences` never allocates the span records or the byte map.
+trait Emit {
+    fn emit(&mut self, kind: Kind, start: usize, end: usize);
+}
+
+/// Layer-producing sink: grouped per rule, in scan order.
+struct SpanCollector<'v, 'a> {
+    view: &'v TextView<'a>,
+    face: Vec<SpanRecord<'a>>,
+    emotion: Vec<SpanRecord<'a>>,
+    emoji: Vec<SpanRecord<'a>>,
+    basic: Vec<SpanRecord<'a>>,
+}
+
+impl<'v, 'a> Emit for SpanCollector<'v, 'a> {
+    fn emit(&mut self, kind: Kind, start: usize, end: usize) {
+        let record = SpanRecord {
+            rule_name: kind.rule_name(),
+            start,
+            end,
+            split_type: Some(kind.split_type()),
+            split_value: Some(self.view.slice(start, end)),
+        };
+        match kind {
+            Kind::Face => self.face.push(record),
+            Kind::Emotion => self.emotion.push(record),
+            Kind::Emoji => self.emoji.push(record),
+            Kind::Basic => self.basic.push(record),
+        }
+    }
+}
+
 struct ScanAll<'a> {
     face: Vec<SpanRecord<'a>>,
     emotion: Vec<SpanRecord<'a>>,
     emoji: Vec<SpanRecord<'a>>,
     basic: Vec<SpanRecord<'a>>,
+}
+
+/// Layer-path entry point: run the fused scanner into grouped `SpanRecord`s.
+fn scan_all<'a>(view: &TextView<'a>) -> ScanAll<'a> {
+    let mut collector = SpanCollector {
+        view,
+        face: Vec::new(),
+        emotion: Vec::new(),
+        emoji: Vec::new(),
+        basic: Vec::new(),
+    };
+    scan_all_with(&view.chars, &mut collector);
+    ScanAll {
+        face: collector.face,
+        emotion: collector.emotion,
+        emoji: collector.emoji,
+        basic: collector.basic,
+    }
 }
 
 /// Fused scanner: find FaceMark, EmotionExpression (words + symbols), Emoji and
@@ -455,65 +534,49 @@ struct ScanAll<'a> {
 /// rule only fires at the *start* of its run (`i == 0` or the previous char not
 /// in that rule's trigger class), which mirrors exactly what the original
 /// consuming finders produced — one span per maximal punct / symbol / emoji /
-/// whitespace run, face marks and emotion words detected at every '(' / '（'.
-/// Because the extractors are the original loops verbatim, per-position output
-/// is byte-for-byte identical to the four separate finders.
-fn scan_all<'a>(view: &TextView<'a>) -> ScanAll<'a> {
-    let chars = &view.chars;
+/// run, face marks and emotion words detected at every '(' / '（'. Because the
+/// extractors are the original loops verbatim, per-position output is
+/// byte-for-byte identical to the four separate finders (regardless of sink).
+fn scan_all_with<E: Emit>(chars: &[char], out: &mut E) {
     let len = chars.len();
-    let mut out = ScanAll {
-        face: Vec::new(),
-        emotion: Vec::new(),
-        emoji: Vec::new(),
-        basic: Vec::new(),
-    };
-
     let mut i = 0usize;
     while i < len {
         let ch = chars[i];
         if ch == '(' || ch == '（' {
-            scan_emotion_word(view, chars, len, i, &mut out.emotion);
-            scan_face_mark(view, chars, len, i, &mut out.face);
+            scan_emotion_word(chars, len, i, out);
+            scan_face_mark(chars, len, i, out);
             i += 1;
             continue;
         }
         if is_basic_punct(ch) {
             if i == 0 || !is_basic_punct(chars[i - 1]) {
-                scan_basic_run(view, chars, len, i, &mut out.basic);
+                scan_basic_run(chars, len, i, out);
             }
             i += 1;
             continue;
         }
         if EMOTION_SYMBOLS.contains(&ch) {
             if i == 0 || !EMOTION_SYMBOLS.contains(&chars[i - 1]) {
-                scan_emotion_symbol_run(view, chars, len, i, &mut out.emotion);
+                scan_emotion_symbol_run(chars, len, i, out);
             }
             i += 1;
             continue;
         }
         if emoji_lookup(ch as u32).is_some() {
             if i == 0 || emoji_lookup(chars[i - 1] as u32).is_none() {
-                scan_emoji_run(view, chars, len, i, &mut out.emoji);
+                scan_emoji_run(chars, len, i, out);
             }
             i += 1;
             continue;
         }
         i += 1;
     }
-
-    out
 }
 
 /// FaceMarkDetector: a kaomoji `(...)` whose body contains at least one
 /// face-symbol character, optionally extended by trailing/leading face-symbol
 /// chars (e.g. `o(^_^)o`).
-fn scan_face_mark<'a>(
-    view: &TextView<'a>,
-    chars: &[char],
-    len: usize,
-    i: usize,
-    out: &mut Vec<SpanRecord<'a>>,
-) {
+fn scan_face_mark<E: Emit>(chars: &[char], len: usize, i: usize, out: &mut E) {
     let mut cursor = i + 1;
     let mut has_symbol2 = false;
     while cursor < len {
@@ -542,40 +605,20 @@ fn scan_face_mark<'a>(
         start -= 1;
     }
 
-    out.push(SpanRecord {
-        rule_name: "FaceMarkDetector",
-        start,
-        end,
-        split_type: Some("facemark"),
-        split_value: Some(view.slice(start, end)),
-    });
+    out.emit(Kind::Face, start, end);
 }
 
 /// EmotionExpressionAnnotator — `(word)` form, e.g. `(笑)` / `（泣）`.
-fn scan_emotion_word<'a>(
-    view: &TextView<'a>,
-    chars: &[char],
-    len: usize,
-    i: usize,
-    out: &mut Vec<SpanRecord<'a>>,
-) {
+fn scan_emotion_word<E: Emit>(chars: &[char], len: usize, i: usize, out: &mut E) {
     for word in EMOTION_WORDS {
-        let word_len = word.chars().count();
-        let end_word = i + 1 + word_len;
+        let end_word = i + 1 + word.chars().count();
         if end_word >= len {
             continue;
         }
-        if view.slice(i + 1, end_word) == *word {
+        if chars_range_eq(chars, i + 1, word) {
             let closing = chars[end_word];
             if closing == ')' || closing == '）' {
-                let end = end_word + 1;
-                out.push(SpanRecord {
-                    rule_name: "EmotionExpressionAnnotator",
-                    start: i,
-                    end,
-                    split_type: Some("EmotionExpressionAnnotator"),
-                    split_value: Some(view.slice(i, end)),
-                });
+                out.emit(Kind::Emotion, i, end_word + 1);
                 break;
             }
         }
@@ -584,13 +627,7 @@ fn scan_emotion_word<'a>(
 
 /// EmotionExpressionAnnotator — symbol form: a maximal run of `…★☆♪` plus (if
 /// present) exactly one following punctuator.
-fn scan_emotion_symbol_run<'a>(
-    view: &TextView<'a>,
-    chars: &[char],
-    len: usize,
-    i: usize,
-    out: &mut Vec<SpanRecord<'a>>,
-) {
+fn scan_emotion_symbol_run<E: Emit>(chars: &[char], len: usize, i: usize, out: &mut E) {
     let start = i;
     let mut j = i;
     while j < len && EMOTION_SYMBOLS.contains(&chars[j]) {
@@ -600,24 +637,12 @@ fn scan_emotion_symbol_run<'a>(
     if j < len && EMOTION_PUNCTUATION.contains(&chars[j]) {
         end += 1;
     }
-    out.push(SpanRecord {
-        rule_name: "EmotionExpressionAnnotator",
-        start,
-        end,
-        split_type: Some("EmotionExpressionAnnotator"),
-        split_value: Some(view.slice(start, end)),
-    });
+    out.emit(Kind::Emotion, start, end);
 }
 
 /// EmojiAnnotator: a maximal run of emoji codepoints that contains at least one
 /// char in a target category (`Smileys & Emotion` or `Symbols`).
-fn scan_emoji_run<'a>(
-    view: &TextView<'a>,
-    chars: &[char],
-    len: usize,
-    i: usize,
-    out: &mut Vec<SpanRecord<'a>>,
-) {
+fn scan_emoji_run<E: Emit>(chars: &[char], len: usize, i: usize, out: &mut E) {
     let start = i;
     let mut j = i;
     let mut any_target = emoji_lookup(chars[j] as u32)
@@ -635,24 +660,12 @@ fn scan_emoji_run<'a>(
         j += 1;
     }
     if any_target {
-        out.push(SpanRecord {
-            rule_name: "EmojiAnnotator",
-            start,
-            end: j,
-            split_type: Some("EmojiAnnotator"),
-            split_value: Some(view.slice(start, j)),
-        });
+        out.emit(Kind::Emoji, start, j);
     }
 }
 
 /// BasicRule: the naive punctuators `[。!?.！？．]+` plus any trailing whitespace.
-fn scan_basic_run<'a>(
-    view: &TextView<'a>,
-    chars: &[char],
-    len: usize,
-    i: usize,
-    out: &mut Vec<SpanRecord<'a>>,
-) {
+fn scan_basic_run<E: Emit>(chars: &[char], len: usize, i: usize, out: &mut E) {
     let start = i;
     let mut j = i;
     while j < len && is_basic_punct(chars[j]) {
@@ -661,13 +674,18 @@ fn scan_basic_run<'a>(
     while j < len && is_ws(chars[j]) {
         j += 1;
     }
-    out.push(SpanRecord {
-        rule_name: "BasicRule",
-        start,
-        end: j,
-        split_type: Some("BasicRule"),
-        split_value: Some(view.slice(start, j)),
-    });
+    out.emit(Kind::Basic, start, j);
+}
+
+/// `chars[start..start + word.len()] == word` — char-vector level compare, so
+/// the scanner never needs the byte map or a per-word allocation.
+fn chars_range_eq(chars: &[char], start: usize, word: &str) -> bool {
+    for (idx, pc) in (start..).zip(word.chars()) {
+        if chars.get(idx) != Some(&pc) {
+            return false;
+        }
+    }
+    true
 }
 
 pub(crate) fn segment_impl(text: &str) -> PipelineOutput<'_> {
@@ -775,19 +793,32 @@ fn is_exception_particle(view: &TextView<'_>, end: usize) -> bool {
         return false;
     }
     for rule in MORPHEME_RULES {
-        if matches_rule(view, idx, rule) {
+        if matches_rule(&view.chars, idx, rule) {
             return true;
         }
     }
     false
 }
 
-fn matches_rule(view: &TextView<'_>, mut index: usize, rule: &[&str]) -> bool {
+fn matches_rule(chars: &[char], mut index: usize, rule: &[&str]) -> bool {
     for part in rule {
-        if !view.starts_with(index, part) {
+        if !chars_starts_with(chars, index, part) {
             return false;
         }
         index += part.chars().count();
+    }
+    true
+}
+
+/// Char-vector equivalent of `text[index..].starts_with(pattern)` — avoids
+/// touching the (lazily built) char→byte map so the boundaries-only path can
+/// check indirect-quote particles without materialising it.
+fn chars_starts_with(chars: &[char], mut index: usize, pattern: &str) -> bool {
+    for pc in pattern.chars() {
+        match chars.get(index) {
+            Some(&c) if c == pc => index += 1,
+            _ => return false,
+        }
     }
     true
 }
@@ -1009,18 +1040,24 @@ struct Bound {
     dot: bool,
 }
 
-#[inline(always)]
-fn merge_bound<'a>(
-    active: &mut Vec<Bound>,
-    seen: &mut HashSet<(usize, usize)>,
-    sr: SpanRecord<'a>,
-) {
-    if seen.insert((sr.start, sr.end)) {
-        active.push(Bound {
-            start: sr.start,
-            end: sr.end,
-            dot: is_dot_value(sr.split_value),
-        });
+/// Boundaries-only sink: merges each fused-scanner hit into the compact `Bound`
+/// list directly — no intermediate `SpanRecord`, no byte-map, no per-span
+/// `split_value`. Only the `"."` flag NumberException reads is kept, derived
+/// from the offsets the same way `split_value` used to be.
+struct BoundMerger<'a> {
+    active: &'a mut Vec<Bound>,
+    seen: &'a mut HashSet<(usize, usize)>,
+    chars: &'a [char],
+}
+
+impl Emit for BoundMerger<'_> {
+    fn emit(&mut self, _kind: Kind, start: usize, end: usize) {
+        if self.seen.insert((start, end)) {
+            // A span whose whole matched text is "." / "．" iff it spans exactly
+            // that single character — equivalent to `split_value == "."`/`"．"`.
+            let dot = end == start + 1 && matches!(self.chars[start], '.' | '．');
+            self.active.push(Bound { start, end, dot });
+        }
     }
 }
 
@@ -1029,12 +1066,11 @@ fn merge_bound<'a>(
 ///
 /// It runs the exact same rules as [`segment_impl`], but forgoes everything
 /// that exists only to produce the `Layer` records: the cumulative clones in
-/// `add_forward_rule`, the sort for the IndirectQuote layer, and the
-/// `SpanRecord`/`Span` materialisation. The candidate-merge loop mirrors the
-/// first-wins-per-(start,end) semantics of the cumulative forward rules
-/// (including the end-of-text sentinel, which suppresses any same-key rule
-/// span), so the surviving candidate set is exactly the final layer of the
-/// full pipeline — verify with the golden/differential suites.
+/// `add_forward_rule`, the sort for the IndirectQuote layer, the `char→byte`
+/// map and the `SpanRecord`/`Span` materialisation (the fused scanner emits
+/// straight into [`BoundMerger`]). First-wins-per-(start,end) semantics
+/// (including the end-of-text sentinel) make the surviving set exactly the
+/// final layer of the full pipeline — verify with the golden/differential suites.
 pub(crate) fn segment_bounds_only(text: &str) -> Vec<usize> {
     let view = TextView::new(text);
     let char_len = view.char_len();
@@ -1049,18 +1085,13 @@ pub(crate) fn segment_bounds_only(text: &str) -> Vec<usize> {
     seen.insert((sentinel.start, sentinel.end));
     active.push(sentinel);
 
-    let scan = scan_all(&view);
-    for sr in scan.face {
-        merge_bound(&mut active, &mut seen, sr);
-    }
-    for sr in scan.emotion {
-        merge_bound(&mut active, &mut seen, sr);
-    }
-    for sr in scan.emoji {
-        merge_bound(&mut active, &mut seen, sr);
-    }
-    for sr in scan.basic {
-        merge_bound(&mut active, &mut seen, sr);
+    {
+        let mut merger = BoundMerger {
+            active: &mut active,
+            seen: &mut seen,
+            chars: &view.chars,
+        };
+        scan_all_with(&view.chars, &mut merger);
     }
 
     active.retain(|c| !is_exception_particle(&view, c.end));

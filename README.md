@@ -123,22 +123,24 @@ built-in Japanese corpus (single thread):
 
 | text size | `segment` | `split_sentences` |
 | --- | ---: | ---: |
-| 61 B (one sentence) | ~0.62 µs | ~0.34 µs |
-| 7 KB (article) | ~50 µs | ~41 µs |
-| 56 KB (long doc) | ~401 µs | ~324 µs |
+| 61 B (one sentence) | ~0.62 µs | ~0.28 µs |
+| 7 KB (article) | ~50 µs | ~35 µs |
+| 56 KB (long doc) | ~395 µs | ~281 µs |
 
 *`segment` materialises every pipeline layer, so it is naturally a bit more
 expensive than `split_sentences`, which runs only the boundary computation over
-a compact representation — no per-layer span records, no IndirectQuote sort.*
+a compact representation — no per-layer span records, no IndirectQuote sort,
+and (lazily) no char→byte map or intermediate span strings.*
 
 Relative to the original regex/HashMap port, the optimisation pass makes
-`segment` ~3.0× faster and `split_sentences` ~1.6× faster on the 7 KB corpus.
+`segment` ~3.0× faster and `split_sentences` ~1.9× faster on the 7 KB corpus.
 The borrow-based `Span`/`Layer`/`Segmentation` (no per-span `String`
 allocations), hand-written scanners for the two regular expressions and the
 emoji-table lookup (dropping the `regex` and `once_cell` dependencies, skipping
 the CJK/kanji range in the emoji scan), direct construction of the unique
 IndirectQuote span set (no cross-layer re-collection), a single-pass fused
-scanner for the FaceMark/Emotion/Emoji/BasicRule annotators, and the
+scanner (generic over the sink, so the boundaries-only path emits compact
+records straight out of the scan), a lazily built char→byte map, and the
 boundaries-only `split_sentences` fast path are the main contributors.
 
 ## License
