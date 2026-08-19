@@ -19,6 +19,130 @@ use std::collections::{HashMap, HashSet};
 
 use crate::emoji_data;
 
+// --- optional built-in stage-timing profiler (feature `prof`, zero-cost off) ---
+#[cfg(feature = "prof")]
+mod prof {
+    use std::cell::RefCell;
+    use std::cmp::Reverse;
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static LOG: RefCell<Vec<(&'static str, u128, Instant)>> = const { RefCell::new(Vec::new()) };
+        static TOT: RefCell<Vec<(&'static str, u128)>> = const { RefCell::new(Vec::new()) };
+        static CALLS: RefCell<usize> = const { RefCell::new(0) };
+    }
+
+    pub fn on() -> bool {
+        std::env::var("BUNKAI_PROF").is_ok()
+    }
+
+    pub fn begin(tag: &'static str) {
+        if on() {
+            LOG.with(|p| p.borrow_mut().push((tag, 0, Instant::now())));
+        }
+    }
+
+    pub fn end() {
+        if !on() {
+            return;
+        }
+        LOG.with(|p| {
+            let mut p = p.borrow_mut();
+            if let Some((_t, acc, t0)) = p.last_mut() {
+                *acc += t0.elapsed().as_nanos();
+            }
+        });
+    }
+
+    /// Stack depth at the start of a `segment_impl` call, used to fold only
+    /// that call's own frames on completion.
+    pub fn enter() -> usize {
+        if on() {
+            LOG.with(|l| l.borrow().len())
+        } else {
+            0
+        }
+    }
+
+    /// Fold the frames at/above `base` (this `segment_impl` call's own) into
+    /// the cumulative totals. Outer caller frames stay on the stack.
+    fn fold(base: usize) {
+        let items: Vec<(&'static str, u128)> = LOG.with(|l| {
+            l.borrow_mut()
+                .drain(base..)
+                .map(|(t, ns, _)| (t, ns))
+                .collect()
+        });
+        TOT.with(|tot| {
+            let mut tot = tot.borrow_mut();
+            for (tag, ns) in items {
+                if let Some(e) = tot.iter_mut().find(|e| e.0 == tag) {
+                    e.1 += ns;
+                } else {
+                    tot.push((tag, ns));
+                }
+            }
+        });
+    }
+
+    fn dump() {
+        let mut rows: Vec<(&'static str, u128)> = TOT.with(|t| t.borrow().clone());
+        rows.sort_by_key(|&(_, n)| Reverse(n));
+        let grand: u128 = rows.iter().map(|(_, n)| n).sum();
+        eprintln!(
+            "--- BUNKAI_PROF call#{} total={:.1?} ---",
+            CALLS.with(|c| *c.borrow()),
+            Duration::from_nanos(grand as u64)
+        );
+        for (tag, ns) in rows {
+            eprintln!(
+                "  {:>34} {:>9.3} ms  {:5.1}%",
+                tag,
+                ns as f64 / 1e6,
+                100.0 * ns as f64 / grand.max(1) as f64
+            );
+        }
+    }
+
+    /// End of one `segment_impl` call: fold its frames; print every 100 calls.
+    pub fn on_impl_done(base: usize) {
+        fold(base);
+        let at = CALLS.with(|c| {
+            *c.borrow_mut() += 1;
+            *c.borrow() % 100
+        });
+        if at == 0 {
+            dump();
+        }
+    }
+
+    /// End of the public `segment()` boundary: fold the materialise frame and
+    /// report the full (segment-specific) picture.
+    pub fn on_segment_done() {
+        if on() {
+            fold(0);
+            dump();
+            LOG.with(|l| l.borrow_mut().clear());
+        }
+    }
+}
+
+#[cfg(not(feature = "prof"))]
+mod prof {
+    #[inline(always)]
+    pub fn begin(_: &'static str) {}
+    #[inline(always)]
+    pub fn end() {}
+    #[inline(always)]
+    pub fn enter() -> usize {
+        0
+    }
+    #[inline(always)]
+    pub fn on_impl_done(_: usize) {}
+    #[inline(always)]
+    pub fn on_segment_done() {}
+}
+
 const TARGET_EMOJI_CATEGORIES: &[&str] = &["Smileys & Emotion", "Symbols"];
 const INDIRECT_RULE_TARGETS: &[&str] = &[
     "first",
@@ -286,13 +410,40 @@ fn is_face_symbol1(ch: char) -> bool {
 /// with a `None` category still belongs to emoji *runs* — so callers must
 /// distinguish those two cases.
 ///
+/// The table has a huge hole between the low block (`0xA9..0x3299`, 170
+/// entries) and the plane-1 block (`0x1F004..`, 1230 entries): the whole
+/// CJK/kanji range `0x3300..0x1F000` contains no emoji at all. Because most
+/// Japanese prose is kana/kanji, we short-circuit that region before touching
+/// the binary search — this is where the bulk of the annotation time went.
+/// The region bounds are derived at compile time and asserted consistent.
+const fn first_ge(data: &[(u32, Option<&'static str>)], threshold: u32) -> usize {
+    let mut i = 0usize;
+    while i < data.len() {
+        if data[i].0 >= threshold {
+            return i;
+        }
+        i += 1;
+    }
+    data.len()
+}
+const EMOJI_LOW_END: usize = first_ge(emoji_data::EMOJI_DATA, 0x3300);
+const EMOJI_HIGH_START: usize = first_ge(emoji_data::EMOJI_DATA, 0x1F000);
+
 /// A hand-written lower-bound loop instead of `slice::binary_search_by_key`
 /// so the whole lookup inlines into the scanning hot loop.
 #[inline]
 fn emoji_lookup(codepoint: u32) -> Option<&'static Option<&'static str>> {
     let data = emoji_data::EMOJI_DATA;
-    let mut lo = 0usize;
-    let mut hi = data.len();
+    let (mut lo, mut hi) = if codepoint < 0x3300 {
+        (0usize, EMOJI_LOW_END)
+    } else if codepoint < 0x1F000 {
+        // The entire CJK/kanji range is emoji-free — this is the hot path
+        // for ordinary Japanese prose.
+        debug_assert_eq!(EMOJI_LOW_END, EMOJI_HIGH_START);
+        return None;
+    } else {
+        (EMOJI_HIGH_START, data.len())
+    };
     while lo < hi {
         let mid = (lo + hi) / 2;
         if data[mid].0 < codepoint {
@@ -307,6 +458,7 @@ fn emoji_lookup(codepoint: u32) -> Option<&'static Option<&'static str>> {
         None
     }
 }
+const _: () = assert!(EMOJI_LOW_END == EMOJI_HIGH_START);
 
 fn find_face_marks<'a>(view: &TextView<'a>) -> Vec<SpanRecord<'a>> {
     let mut spans: Vec<SpanRecord<'_>> = Vec::new();
@@ -432,27 +584,50 @@ fn find_emotion_expressions<'a>(view: &TextView<'a>) -> Vec<SpanRecord<'a>> {
 }
 
 pub(crate) fn segment_impl(text: &str) -> PipelineOutput<'_> {
+    let prof_base = prof::enter();
     let view = TextView::new(text);
+    prof::begin("new(TextView)");
     let mut state = PipelineState::new(view.char_len());
+    prof::end();
 
+    prof::begin("FaceMarkDetector");
     let face_spans = find_face_marks(&view);
     state.add_forward_rule("FaceMarkDetector", face_spans);
+    prof::end();
 
+    prof::begin("EmotionExpressionAnnotator");
     let emotion_spans = find_emotion_expressions(&view);
     state.add_forward_rule("EmotionExpressionAnnotator", emotion_spans);
+    prof::end();
 
+    prof::begin("EmojiAnnotator");
     let emoji_spans = build_emoji_spans(&view);
     state.add_forward_rule("EmojiAnnotator", emoji_spans);
+    prof::end();
 
+    prof::begin("BasicRule");
     let basic_rule_spans = find_basic_rule(&view);
     state.add_forward_rule("BasicRule", basic_rule_spans);
+    prof::end();
 
+    prof::begin("IndirectQuote");
     apply_indirect_quote(&view, &mut state);
+    prof::end();
+    prof::begin("DotException");
     apply_dot_exception(&view, &mut state);
+    prof::end();
+    prof::begin("NumberException");
     apply_number_exception(&view, &mut state);
+    prof::end();
+    prof::begin("LinebreakForce");
     apply_linebreak_force(&view, &mut state);
+    prof::end();
 
-    state.into_output()
+    prof::begin("into_output");
+    let out = state.into_output();
+    prof::end();
+    prof::on_impl_done(prof_base);
+    out
 }
 
 /// Hand-written equivalent of the old `[。!?.！？．]+\s*` regex: a maximal run
@@ -534,7 +709,12 @@ fn find_emoji_spans(view: &TextView<'_>) -> Vec<EmojiSpan> {
 }
 
 fn apply_indirect_quote<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) {
-    let mut collected: Vec<SpanRecord<'_>> = Vec::new();
+    prof::begin("i.unify");
+    let total_target: usize = INDIRECT_RULE_TARGETS
+        .iter()
+        .filter_map(|&t| state.get_layer(t).map(|l| l.len()))
+        .sum();
+    let mut collected: Vec<SpanRecord<'_>> = Vec::with_capacity(total_target);
     for &target in INDIRECT_RULE_TARGETS {
         if let Some(layer) = state.get_layer(target) {
             for span in layer {
@@ -546,6 +726,7 @@ fn apply_indirect_quote<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) 
         }
     }
     let unified = unify_span_annotations(collected);
+    prof::end();
     state.add_layer("IndirectQuoteExceptionAnnotator", unified);
 }
 
@@ -872,7 +1053,11 @@ impl<'a> From<PipelineOutput<'a>> for Segmentation {
 /// Returns the full [`Segmentation`] result, including every intermediate
 /// pipeline layer and the final list of character-offset boundaries.
 pub fn segment(text: &str) -> Segmentation {
-    segment_impl(text).into()
+    prof::begin("materialize");
+    let seg: Segmentation = segment_impl(text).into();
+    prof::end();
+    prof::on_segment_done();
+    seg
 }
 
 /// Split `text` into its sentences, returning the substrings themselves.

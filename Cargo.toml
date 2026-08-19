@@ -9,6 +9,11 @@ repository = "https://github.com/megagonlabs/bunkai"
 keywords = ["japanese", "nlp", "sentence", "segmentation", "boundary", "disambiguation"]
 categories = ["text-processing"]
 
+[features]
+# Enable the built-in BUNKAI_PROF stage-timing profiler (see src/core.rs).
+# Off by default so builds carry zero instrumentation overhead.
+prof = []
+
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }
 
