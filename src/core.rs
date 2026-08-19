@@ -1091,83 +1091,50 @@ struct Bound {
     end: u32,
 }
 
-/// Boundaries-only sink: pushes each fused-scanner hit straight onto the
-/// compact `Bound` list — no intermediate `SpanRecord`, no byte-map, no
-/// per-span `split_value`, and no membership set.
+/// Compute the final sentence-boundary offsets as *byte* offsets, without
+/// materialising any annotation layer, any `Vec<char>` or the `char→byte` map
+/// — the fast path behind [`split_sentences`].
 ///
-/// The first-wins-per-(start,end) dedup the layer path performs is not needed
-/// here: different rules never produce identical (start,end) (their trigger
-/// characters are disjoint), and the only possible collision — a one-char rule
-/// span at the very last position vs the end-of-text sentinel — resolves to the
-/// same boundary offset in the final sort+dedup, and every exception check
-/// returns false for `end == char_len`. So the merge is a plain append.
-struct BoundMerger<'a> {
-    active: &'a mut Vec<Bound>,
-    /// Newline whitespace runs, in scan order (linebreak spans).
-    linebreaks: Vec<(usize, usize)>,
-}
-
-impl Emit for BoundMerger<'_> {
-    fn emit(&mut self, kind: Kind, start: usize, end: usize) {
-        if let Kind::Linebreak = kind {
-            self.linebreaks.push((start, end));
-            return;
-        }
-        self.active.push(Bound {
-            start: start as u32,
-            end: end as u32,
-        });
-    }
-}
-
-/// Compute the final sentence-boundary offsets *without* materialising any
-/// annotation layer — the fast path behind [`split_sentences`].
-///
-/// It runs the exact same rules as [`segment_impl`], but forgoes everything
-/// that exists only to produce the `Layer` records: the cumulative clones in
-/// `add_forward_rule`, the sort for the IndirectQuote layer, the `char→byte`
-/// map and the `SpanRecord`/`Span` materialisation (the fused scanner emits
-/// straight into [`BoundMerger`]). First-wins-per-(start,end) semantics
-/// (including the end-of-text sentinel) make the surviving set exactly the
-/// final layer of the full pipeline — verify with the golden/differential suites.
-pub(crate) fn segment_bounds_only(text: &str) -> Vec<usize> {
-    let view = TextView::new(text);
-    let char_len = view.char_len();
-    let sentinel = Bound {
-        start: (if char_len == 0 { 0 } else { char_len - 1 }) as u32,
-        end: char_len as u32,
-    };
-
+/// It runs the exact same rules as [`segment_impl`], but scans the UTF-8 bytes
+/// directly (decoding inline, once) and emits compact [`Bound`]s straight out
+/// of the scanner; no per-layer records, sorting, or materialisation. Every
+/// offset is on a char boundary (spans are only emitted at char starts), so the
+/// caller can slice `text` at each one directly. First-wins-per-(start,end)
+/// semantics (including the end-of-text sentinel) make the surviving set
+/// exactly the final layer's boundaries re-expressed in bytes — verified by the
+/// golden/differential suites and the bounds-vs-pipeline property test.
+pub(crate) fn sentence_byte_boundaries(text: &str) -> Vec<usize> {
+    let len = text.len();
     let mut active: Vec<Bound> = Vec::new();
     // The sentinel guarantees the end-of-text boundary; pushed first but, with
     // no dedup set, a one-char rule span at the very last position may also
     // land here — the final {sort,dedup} of `ends` collapses them.
-    active.push(sentinel);
+    active.push(Bound {
+        start: len as u32,
+        end: len as u32,
+    });
 
-    let linebreaks = {
-        let mut merger = BoundMerger {
-            active: &mut active,
-            linebreaks: Vec::new(),
-        };
-        scan_all_with(&view.chars, &mut merger);
-        merger.linebreaks
-    };
+    let mut linebreaks: Vec<(usize, usize)> = Vec::new();
+    scan_bounds_bytes(text, &mut active, &mut linebreaks);
 
     // One pass over the candidates (instead of three `retain`s): particle, dot
     // and number exceptions are all per-span and independent.
     active.retain(|c| {
         let start = c.start as usize;
         let end = c.end as usize;
-        if is_exception_particle(&view, end) {
+        if is_exception_particle_bytes(text, end) {
             return false;
         }
-        if is_exception_numeric(&view, start) || is_exception_mailaddress(&view, start) {
+        if is_exception_numeric_bytes(text, start)
+            || is_exception_mailaddress_bytes(text, start)
+        {
             return false;
         }
         // A span whose whole matched text is "." / "．" iff it spans exactly
-        // that single character — equivalent to `split_value == "."`/`"．"`.
-        let is_dot = end == start + 1 && matches!(view.chars[start], '.' | '．');
-        !is_exception_no_parts(&view, start, end, is_dot)
+        // that single character — byte-length equivalent of
+        // `end == start + 1 && chars[start] ∈ {'.','．'}`.
+        let is_dot = byte_bound_is_dot(text, start, end);
+        !is_exception_no_parts_bytes(text, start, end, is_dot)
     });
     active = apply_linebreak_force_bounds(active, &linebreaks);
 
@@ -1175,6 +1142,410 @@ pub(crate) fn segment_bounds_only(text: &str) -> Vec<usize> {
     ends.sort_unstable();
     ends.dedup();
     ends
+}
+
+/// Infallible decoding of the scalar value at byte offset `b` of a valid UTF-8
+/// slice, plus its byte length. Callers guarantee `b` is on a char boundary and
+/// the char is fully in-bounds (the loop / run guards hold everywhere). No
+/// Option, no `char::from_u32` validation branch — the `&str` guarantees a
+/// valid scalar, so the unchecked conversion below is sound.
+#[inline]
+fn char_at_byte(bytes: &[u8], b: usize) -> (char, usize) {
+    let first = bytes[b];
+    let cp = if first < 0x80 {
+        first as u32
+    } else if first < 0xE0 {
+        ((first & 0x1F) as u32) << 6 | (bytes[b + 1] & 0x3F) as u32
+    } else if first < 0xF0 {
+        ((first & 0x0F) as u32) << 12
+            | ((bytes[b + 1] & 0x3F) as u32) << 6
+            | (bytes[b + 2] & 0x3F) as u32
+    } else {
+        ((first & 0x07) as u32) << 18
+            | ((bytes[b + 1] & 0x3F) as u32) << 12
+            | ((bytes[b + 2] & 0x3F) as u32) << 6
+            | (bytes[b + 3] & 0x3F) as u32
+    };
+    // `first` gives the length directly; the codepoint is valid by construction
+    // (the slice is a `&str`), so the indexing and unchecked conversion are
+    // sound. One `unsafe` block keeps the doc/caller invariant in one place.
+    // SAFETY: `b` is a char boundary within `bytes`; every multi-byte lead is
+    // followed in-bounds by its continuation bytes (slices come from `&str`),
+    // and `bytes` decodes from a valid UTF-8 string, so `cp` is a valid scalar.
+    let (ch, n) = unsafe {
+        let ch = char::from_u32_unchecked(cp);
+        let n = if first < 0x80 {
+            1
+        } else if first < 0xE0 {
+            2
+        } else if first < 0xF0 {
+            3
+        } else {
+            4
+        };
+        (ch, n)
+    };
+    (ch, n)
+}
+
+/// Decode the scalar value at byte offset `b`, guarded: returns `None` when
+/// `b` is past the end of the slice. Used only by the exception predicates
+/// (rare, at span boundaries), never the hot scan loop.
+#[inline]
+fn char_at_byte_opt(bytes: &[u8], b: usize) -> Option<(char, usize)> {
+    if b >= bytes.len() {
+        return None;
+    }
+    let (c, n) = char_at_byte(bytes, b);
+    Some((c, n))
+}
+
+/// Byte offset of the previous char's leading byte, given a char boundary `b`.
+/// Walks back over UTF-8 continuation bytes (at most 3).
+#[inline]
+fn prev_char_start(bytes: &[u8], b: usize) -> usize {
+    debug_assert!(b > 0 && b <= bytes.len());
+    let mut p = b - 1;
+    while p > 0 && (bytes[p] & 0xC0) == 0x80 {
+        p -= 1;
+    }
+    p
+}
+
+/// Byte-level fused scanner, mirroring [`scan_all_with`] over the char vec body
+/// for body. Walks the UTF-8 bytes once, decoding each codepoint inline, and
+/// pushes *byte*-offset [`Bound`]s directly — no `Vec<char>` build, no char→byte
+/// map, no second decode pass. The dispatch and each run rule are byte-for-byte
+/// mirrors of the char scanner, so every emit lands on a char boundary and the
+/// surviving set is identical to the pipeline's final layer re-expressed in
+/// bytes (guarded by the bounds-vs-pipeline property test and the golden suite).
+fn scan_bounds_bytes(text: &str, active: &mut Vec<Bound>, linebreaks: &mut Vec<(usize, usize)>) {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut b = 0usize;
+    let mut prev: Option<char> = None;
+    while b < len {
+        let (ch, n) = char_at_byte(bytes, b);
+        match ch {
+            '(' | '（' => {
+                scan_emotion_word_bytes(bytes, len, b, n, active);
+                scan_face_mark_bytes(bytes, len, b, n, active);
+            }
+            '。' | '!' | '?' | '.' | '！' | '？' | '．' => {
+                if !prev.is_some_and(is_basic_punct) {
+                    scan_basic_run_bytes(bytes, len, b, active);
+                }
+            }
+            '…' | '★' | '☆' | '♪' => {
+                if !prev.is_some_and(|p| EMOTION_SYMBOLS.contains(&p)) {
+                    scan_emotion_symbol_run_bytes(bytes, len, b, active);
+                }
+            }
+            _ => {
+                if emoji_lookup(ch as u32).is_some() {
+                    if !prev.is_some_and(|p| emoji_lookup(p as u32).is_some()) {
+                        scan_emoji_run_bytes(bytes, len, b, active);
+                    }
+                } else if is_ws(ch) {
+                    // Linebreak detection, folded into the same pass: a
+                    // whitespace run is visited at its start only.
+                    if !prev.is_some_and(is_ws) {
+                        let start = b;
+                        let mut j = b;
+                        let mut has_newline = false;
+                        while j < len {
+                            let (wc, wn) = char_at_byte(bytes, j);
+                            if !is_ws(wc) {
+                                break;
+                            }
+                            if wc == '\n' {
+                                has_newline = true;
+                            }
+                            j += wn;
+                        }
+                        if has_newline {
+                            linebreaks.push((start, j));
+                        }
+                    }
+                }
+            }
+        }
+        prev = Some(ch);
+        b += n;
+    }
+}
+
+/// `[。!?.！？．]+` plus trailing whitespace.
+fn scan_basic_run_bytes(bytes: &[u8], len: usize, start: usize, active: &mut Vec<Bound>) {
+    let mut j = start;
+    while j < len {
+        let (c, n) = char_at_byte(bytes, j);
+        if !is_basic_punct(c) {
+            break;
+        }
+        j += n;
+    }
+    while j < len {
+        let (c, n) = char_at_byte(bytes, j);
+        if !is_ws(c) {
+            break;
+        }
+        j += n;
+    }
+    active.push(Bound {
+        start: start as u32,
+        end: j as u32,
+    });
+}
+
+/// A maximal run of `…★☆♪` plus (if present) exactly one following punctuator.
+fn scan_emotion_symbol_run_bytes(
+    bytes: &[u8],
+    len: usize,
+    start: usize,
+    active: &mut Vec<Bound>,
+) {
+    let mut j = start;
+    while j < len {
+        let (c, n) = char_at_byte(bytes, j);
+        if !EMOTION_SYMBOLS.contains(&c) {
+            break;
+        }
+        j += n;
+    }
+    let mut end = j;
+    if j < len {
+        let (c, n) = char_at_byte(bytes, j);
+        if EMOTION_PUNCTUATION.contains(&c) {
+            end = j + n;
+        }
+    }
+    active.push(Bound {
+        start: start as u32,
+        end: end as u32,
+    });
+}
+
+/// A maximal run of emoji codepoints containing a target-category char.
+fn scan_emoji_run_bytes(bytes: &[u8], len: usize, start: usize, active: &mut Vec<Bound>) {
+    let mut j = start;
+    let mut any_target = false;
+    while j < len {
+        let (c, n) = char_at_byte(bytes, j);
+        let Some(category) = emoji_lookup(c as u32).copied() else {
+            break;
+        };
+        if category.is_some_and(|cat| TARGET_EMOJI_CATEGORIES.contains(&cat)) {
+            any_target = true;
+        }
+        j += n;
+    }
+    if any_target {
+        active.push(Bound {
+            start: start as u32,
+            end: j as u32,
+        });
+    }
+}
+
+/// `(word)` emotion expression, e.g. `(笑)` / `（泣）`.
+fn scan_emotion_word_bytes(
+    bytes: &[u8],
+    len: usize,
+    start: usize,
+    trig_len: usize,
+    active: &mut Vec<Bound>,
+) {
+    for word in EMOTION_WORDS {
+        let wbytes = word.as_bytes();
+        let after = start + trig_len + wbytes.len();
+        if after >= len {
+            continue;
+        }
+        if bytes[start + trig_len..].starts_with(wbytes) {
+            let (closing, n) = char_at_byte(bytes, after);
+            if closing == ')' || closing == '）' {
+                active.push(Bound {
+                    start: start as u32,
+                    end: (after + n) as u32,
+                });
+                break;
+            }
+        }
+    }
+}
+
+/// Kaomoji `(...)` with a face-symbol body, extended by face-symbol chars.
+fn scan_face_mark_bytes(
+    bytes: &[u8],
+    len: usize,
+    start: usize,
+    trig_len: usize,
+    active: &mut Vec<Bound>,
+) {
+    let mut cur = start + trig_len;
+    let mut has_symbol2 = false;
+    while cur < len {
+        let (c, n) = char_at_byte(bytes, cur);
+        if !is_face_symbol1(c) {
+            break;
+        }
+        if is_face_symbol2(c) {
+            has_symbol2 = true;
+        }
+        cur += n;
+    }
+    if !has_symbol2 || cur >= len {
+        return;
+    }
+    let (closing, n) = char_at_byte(bytes, cur);
+    if closing != ')' && closing != '）' {
+        return;
+    }
+    let mut end = cur + n;
+    while end < len {
+        let (c, n) = char_at_byte(bytes, end);
+        if !is_face_symbol_prefix_suffix(c) {
+            break;
+        }
+        end += n;
+    }
+    let mut st = start;
+    while st > 0 {
+        let p = prev_char_start(bytes, st);
+        let (c, _) = char_at_byte(bytes, p);
+        if !is_face_symbol_prefix_suffix(c) {
+            break;
+        }
+        st = p;
+    }
+    active.push(Bound {
+        start: st as u32,
+        end: end as u32,
+    });
+}
+
+/// Byte-level equivalents of the exception predicates; see the `TextView`
+/// versions for the reference semantics. Reads are anchored on byte offsets
+/// (span boundaries are char-aligned), so "previous char" means stepping back
+/// to the previous lead byte.
+fn is_exception_particle_bytes(text: &str, end: usize) -> bool {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    if end >= len {
+        return false;
+    }
+    let mut idx = end;
+    while idx < len
+        && char_at_byte_opt(bytes, idx).is_some_and(|(c, _)| c == '\n')
+        && idx + 1 < len
+    {
+        idx += 1;
+    }
+    let Some((next, _)) = char_at_byte_opt(bytes, idx) else {
+        return false;
+    };
+    if !matches!(
+        next,
+        'て' | 'の' | 'と' | 'っ' | 'に' | 'な' | 'く' | 'も' | 'ほ'
+    ) {
+        return false;
+    }
+    for rule in MORPHEME_RULES {
+        if matches_rule_bytes(bytes, idx, rule) {
+            return true;
+        }
+    }
+    false
+}
+
+fn matches_rule_bytes(bytes: &[u8], mut index: usize, rule: &[&str]) -> bool {
+    for part in rule {
+        if !bytes[index..].starts_with(part.as_bytes()) {
+            return false;
+        }
+        index += part.len();
+    }
+    true
+}
+
+fn is_exception_numeric_bytes(text: &str, start: usize) -> bool {
+    let bytes = text.as_bytes();
+    if start == 0 {
+        return false;
+    }
+    let Some((dot, dot_len)) = char_at_byte_opt(bytes, start) else {
+        return false;
+    };
+    if dot != '.' && dot != '．' {
+        return false;
+    }
+    let after = start + dot_len;
+    if after >= bytes.len() {
+        return false;
+    }
+    let (prev, _) = char_at_byte(bytes, prev_char_start(bytes, start));
+    let (next, _) = char_at_byte(bytes, after);
+    is_numeric_char(prev) && is_numeric_char(next)
+}
+
+fn is_exception_mailaddress_bytes(text: &str, start: usize) -> bool {
+    let bytes = text.as_bytes();
+    if start == 0 {
+        return false;
+    }
+    let Some((dot, dot_len)) = char_at_byte_opt(bytes, start) else {
+        return false;
+    };
+    if dot != '.' && dot != '．' {
+        return false;
+    }
+    let after = start + dot_len;
+    if after >= bytes.len() {
+        return false;
+    }
+    let (prev, _) = char_at_byte(bytes, prev_char_start(bytes, start));
+    let (next, _) = char_at_byte(bytes, after);
+    is_mail_char(prev) && is_mail_char(next)
+}
+
+/// `end == start + 1 && chars[start] ∈ {'.','．'}` in byte terms: the span
+/// covers exactly that single character.
+#[inline]
+fn byte_bound_is_dot(text: &str, start: usize, end: usize) -> bool {
+    let bytes = text.as_bytes();
+    let Some((c, n)) = char_at_byte_opt(bytes, start) else {
+        return false;
+    };
+    (c == '.' || c == '．') && end == start + n
+}
+
+fn is_exception_no_parts_bytes(text: &str, start: usize, end: usize, is_dot: bool) -> bool {
+    let bytes = text.as_bytes();
+    if !is_dot {
+        return false;
+    }
+    if start == 0 {
+        return false;
+    }
+    let o = prev_char_start(bytes, start);
+    if o == 0 {
+        return false; // fewer than two chars before the span start
+    }
+    if end >= bytes.len() {
+        return false;
+    }
+    let n = prev_char_start(bytes, o);
+    let (n_char, _) = char_at_byte(bytes, n);
+    let (o_char, _) = char_at_byte(bytes, o);
+    if !matches!(n_char, 'N' | 'n' | 'Ｎ' | 'ｎ') {
+        return false;
+    }
+    if !matches!(o_char, 'O' | 'o' | 'Ｏ' | 'ｏ') {
+        return false;
+    }
+    let (next_char, _) = char_at_byte(bytes, end);
+    next_char.is_ascii_digit()
 }
 
 fn apply_linebreak_force_bounds(
@@ -1347,27 +1718,21 @@ pub fn split_sentences(text: &str) -> Vec<&str> {
 }
 
 fn split_sentences_impl(text: &str) -> Vec<&str> {
-    let boundaries = segment_bounds_only(text);
+    // `sentence_byte_boundaries` returns byte offsets (always char-aligned), so
+    // the sentences are plain slices — no char-index→byte translation pass.
+    let boundaries = sentence_byte_boundaries(text);
 
-    // `final_boundaries` holds char indices, but we need byte offsets to slice.
-    // Walk char_indices once, cutting at each boundary as we go — this avoids
-    // materialising a full char-index→byte-offset Vec (one fewer whole-text pass).
     let mut out = Vec::with_capacity(boundaries.len() + 1);
-    let mut start_byte = 0usize;
-    let mut bi = 0usize; // next boundary to cut at
-    for (char_idx, (byte, _)) in text.char_indices().enumerate() {
-        if bi < boundaries.len() && char_idx == boundaries[bi] {
-            // `byte` is this char's start and also the byte offset of the
-            // just-completed sentence's end boundary.
-            out.push(&text[start_byte..byte]);
-            start_byte = byte;
-            bi += 1;
+    let mut start = 0usize;
+    for &b in &boundaries {
+        if b > start {
+            out.push(&text[start..b]);
+            start = b;
         }
     }
-    // Any boundary equal to the char length (end of text) leaves the final
-    // sentence to be emitted here. `start_byte` is always a char boundary.
-    if start_byte < text.len() {
-        out.push(&text[start_byte..]);
+    // A final boundary equal to the byte length leaves the last sentence here.
+    if start < text.len() {
+        out.push(&text[start..]);
     }
     out
 }
@@ -1575,9 +1940,24 @@ mod tests {
         }
         for (i, text) in cases.iter().enumerate() {
             let via_layers = segment(text).final_boundaries;
-            let via_bounds = segment_bounds_only(text);
+            let via_bounds = sentence_byte_boundaries(text);
+            // `final_boundaries` are char indices; the byte path returns byte
+            // offsets. Convert one to the other for the direct comparison.
+            let mut via_layers_bytes: Vec<usize> = Vec::with_capacity(via_layers.len());
+            let mut bi = 0usize;
+            for (char_idx, (byte, _)) in text.char_indices().enumerate() {
+                if bi < via_layers.len() && char_idx == via_layers[bi] {
+                    via_layers_bytes.push(byte);
+                    bi += 1;
+                }
+            }
+            if bi < via_layers.len() {
+                // Trailing boundary equals the character count → byte length.
+                debug_assert_eq!(via_layers[bi], text.chars().count());
+                via_layers_bytes.push(text.len());
+            }
             assert_eq!(
-                via_bounds, via_layers,
+                via_bounds, via_layers_bytes,
                 "case #{i} bounds-only diverges from full pipeline: {text:?}"
             );
             // Property check for the slicing: split_sentences must cut exactly
