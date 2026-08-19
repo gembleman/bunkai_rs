@@ -199,6 +199,11 @@ fn is_basic_punct(ch: char) -> bool {
 /// the whole Unicode range, 25 codepoints).
 #[inline]
 fn is_ws(ch: char) -> bool {
+    // All 25 White_Space codepoints are ≤ U+3000; kana/kanji/etc are above it,
+    // so a single compare decides the overwhelmingly-common case.
+    if (ch as u32) > 0x3000 {
+        return false;
+    }
     matches!(
         ch,
         '\u{0009}'..='\u{000D}'
@@ -412,6 +417,14 @@ const EMOJI_HIGH_START: usize = first_ge(emoji_data::EMOJI_DATA, 0x1F000);
 /// so the whole lookup inlines into the scanning hot loop.
 #[inline]
 fn emoji_lookup(codepoint: u32) -> Option<&'static Option<&'static str>> {
+    // Fast reject for the dominant emoji-free Japanese ranges: kana (hiragana
+    // + katakana) and the katakana phonetic extensions sit below 0x3300, so
+    // they would otherwise fall into the ~170-entry low-block binary search on
+    // every single character. The ranges hold no emoji (verified against the
+    // table: the nearest low-block emoji are 0x3030/0x303D/0x3297/0x3299).
+    if (0x3040..=0x30FF).contains(&codepoint) || (0x31F0..=0x31FF).contains(&codepoint) {
+        return None;
+    }
     let data = emoji_data::EMOJI_DATA;
     let (mut lo, mut hi) = if codepoint < 0x3300 {
         (0usize, EMOJI_LOW_END)
@@ -1055,12 +1068,13 @@ fn apply_linebreak_force<'a>(
 /// Compact span for the boundaries-only fast path used by [`split_sentences`].
 /// Only the fields the downstream rules actually read are kept: the offsets
 /// each exception checks, and a flag for whether the matched text is exactly
-/// `"."` or `"．"` (the sole `split_value` that `NumberException` inspects).
+/// One boundary candidate. Kept to exactly two `usize`s (16 bytes) so the
+/// `active` Vec stays cache-friendly; the `"."`-flag NumberException checks is
+/// derived on the fly from the offsets instead of being stored.
 #[derive(Clone, Copy, Debug)]
 struct Bound {
     start: usize,
     end: usize,
-    dot: bool,
 }
 
 /// Boundaries-only sink: pushes each fused-scanner hit straight onto the
@@ -1075,7 +1089,6 @@ struct Bound {
 /// returns false for `end == char_len`. So the merge is a plain append.
 struct BoundMerger<'a> {
     active: &'a mut Vec<Bound>,
-    chars: &'a [char],
     /// Newline whitespace runs, in scan order (linebreak spans).
     linebreaks: Vec<(usize, usize)>,
 }
@@ -1086,10 +1099,7 @@ impl Emit for BoundMerger<'_> {
             self.linebreaks.push((start, end));
             return;
         }
-        // A span whose whole matched text is "." / "．" iff it spans exactly
-        // that single character — equivalent to `split_value == "."`/`"．"`.
-        let dot = end == start + 1 && matches!(self.chars[start], '.' | '．');
-        self.active.push(Bound { start, end, dot });
+        self.active.push(Bound { start, end });
     }
 }
 
@@ -1109,7 +1119,6 @@ pub(crate) fn segment_bounds_only(text: &str) -> Vec<usize> {
     let sentinel = Bound {
         start: if char_len == 0 { 0 } else { char_len - 1 },
         end: char_len,
-        dot: false,
     };
 
     let mut active: Vec<Bound> = Vec::new();
@@ -1121,18 +1130,26 @@ pub(crate) fn segment_bounds_only(text: &str) -> Vec<usize> {
     let linebreaks = {
         let mut merger = BoundMerger {
             active: &mut active,
-            chars: &view.chars,
             linebreaks: Vec::new(),
         };
         scan_all_with(&view.chars, &mut merger);
         merger.linebreaks
     };
 
-    active.retain(|c| !is_exception_particle(&view, c.end));
+    // One pass over the candidates (instead of three `retain`s): particle, dot
+    // and number exceptions are all per-span and independent.
     active.retain(|c| {
-        !is_exception_numeric(&view, c.start) && !is_exception_mailaddress(&view, c.start)
+        if is_exception_particle(&view, c.end) {
+            return false;
+        }
+        if is_exception_numeric(&view, c.start) || is_exception_mailaddress(&view, c.start) {
+            return false;
+        }
+        // A span whose whole matched text is "." / "．" iff it spans exactly
+        // that single character — equivalent to `split_value == "."`/`"．"`.
+        let is_dot = c.end == c.start + 1 && matches!(view.chars[c.start], '.' | '．');
+        !is_exception_no_parts(&view, c.start, c.end, is_dot)
     });
-    active.retain(|c| !is_exception_no_parts(&view, c.start, c.end, c.dot));
     active = apply_linebreak_force_bounds(active, &linebreaks);
 
     let mut ends: Vec<usize> = active.iter().map(|c| c.end).collect();
@@ -1157,18 +1174,13 @@ fn apply_linebreak_force_bounds(
             result.push(Bound {
                 start: lb_start,
                 end: lb_end,
-                dot: false,
             });
         } else {
             result.push(c);
         }
     }
     for (_, (start, end)) in map.into_iter() {
-        result.push(Bound {
-            start,
-            end,
-            dot: false,
-        });
+        result.push(Bound { start, end });
     }
     result
 }
