@@ -144,15 +144,10 @@ mod prof {
 }
 
 const TARGET_EMOJI_CATEGORIES: &[&str] = &["Smileys & Emotion", "Symbols"];
-const INDIRECT_RULE_TARGETS: &[&str] = &[
-    "first",
-    "BasicRule",
-    "LinebreakAnnotator",
-    "EmojiAnnotator",
-    "EmotionExpressionAnnotator",
-    "FaceMarkDetector",
-];
 
+// Legacy list of layers that used to be swept by the indirect-quote rule
+// (first/BasicRule/LinebreakAnnotator/EmojiAnnotator/EmotionExpressionAnnotator/
+// FaceMarkDetector). Superseded by collecting the cumulative final layer directly.
 const MORPHEME_RULES: &[&[&str]] = &[
     &["て"],
     &["の"],
@@ -236,7 +231,6 @@ pub(crate) struct LayerOutput<'a> {
 
 struct PipelineState<'a> {
     layers: Vec<LayerOutput<'a>>,
-    name_to_index: HashMap<&'static str, usize>,
     final_index: usize,
 }
 
@@ -254,11 +248,8 @@ impl<'a> PipelineState<'a> {
             name: "first",
             spans: vec![sentinel],
         };
-        let mut name_to_index = HashMap::new();
-        name_to_index.insert("first", 0);
         Self {
             layers: vec![layer],
-            name_to_index,
             final_index: 0,
         }
     }
@@ -267,16 +258,9 @@ impl<'a> PipelineState<'a> {
         &self.layers[self.final_index].spans
     }
 
-    fn get_layer(&self, name: &'static str) -> Option<&[SpanRecord<'a>]> {
-        self.name_to_index
-            .get(name)
-            .map(|idx| self.layers[*idx].spans.as_slice())
-    }
-
     fn add_layer(&mut self, name: &'static str, spans: Vec<SpanRecord<'a>>) {
         let idx = self.layers.len();
         self.layers.push(LayerOutput { name, spans });
-        self.name_to_index.insert(name, idx);
         self.final_index = idx;
     }
 
@@ -710,30 +694,35 @@ fn find_emoji_spans(view: &TextView<'_>) -> Vec<EmojiSpan> {
 
 fn apply_indirect_quote<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) {
     prof::begin("i.unify");
-    let total_target: usize = INDIRECT_RULE_TARGETS
-        .iter()
-        .filter_map(|&t| state.get_layer(t).map(|l| l.len()))
-        .sum();
-    // The target layers are cumulative (each forward rule re-includes all
-    // earlier layers), so the same span appears many times across them; the
-    // sort+dedup in `unify_span_annotations` collapses those to a unique set.
-    let mut collected: Vec<SpanRecord<'_>> = Vec::with_capacity(total_target);
-    for &target in INDIRECT_RULE_TARGETS {
-        if let Some(layer) = state.get_layer(target) {
-            for span in layer {
-                if is_exception_particle(view, span.start, span.end) {
-                    continue;
-                }
-                collected.push(span.clone());
-            }
+    // `final_spans()` (the BasicRule layer) already holds the *unique* union
+    // of every earlier annotator layer's spans (FaceMark + Emotion + Emoji +
+    // BasicRule) and the end-of-text sentinel, because each `add_forward_rule`
+    // re-includes the previous layer's spans. The old `INDIRECT_RULE_TARGETS`
+    // sweep only re-collected those same records a few times over (every
+    // target layer is cumulative), then relied on `unify_span_annotations` to
+    // sort+dedup the redundancy away. Build the unique set directly.
+    let mut spans: Vec<SpanRecord<'_>> = Vec::with_capacity(state.final_spans().len());
+    for span in state.final_spans() {
+        if is_exception_particle(view, span.end) {
+            continue;
         }
+        spans.push(span.clone());
     }
-    let unified = unify_span_annotations(collected);
+    // (start,end) is unique in the source layer (`filter_previous_rule_same_span`
+    // keeps at most one record per key) and the exception filter only removes
+    // records, so there are no equal sort keys: an unstable sort cannot differ
+    // from the previous stable one, and it avoids the merge-sort temp buffer.
+    spans.sort_unstable_by(|a, b| a.start.cmp(&b.start).then(a.end.cmp(&b.end)));
+    debug_assert!(
+        spans
+            .windows(2)
+            .all(|w| w[0].start != w[1].start || w[0].end != w[1].end)
+    );
     prof::end();
-    state.add_layer("IndirectQuoteExceptionAnnotator", unified);
+    state.add_layer("IndirectQuoteExceptionAnnotator", spans);
 }
 
-fn is_exception_particle(view: &TextView<'_>, _start: usize, end: usize) -> bool {
+fn is_exception_particle(view: &TextView<'_>, end: usize) -> bool {
     if end >= view.char_len() {
         return false;
     }
@@ -876,7 +865,7 @@ fn is_mail_char(ch: char) -> bool {
 fn apply_number_exception<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) {
     let mut filtered: Vec<SpanRecord<'_>> = Vec::with_capacity(state.final_spans().len());
     for span in state.final_spans().iter() {
-        if is_exception_no(view, span) {
+        if is_exception_no_parts(view, span.start, span.end, is_dot_value(span.split_value)) {
             continue;
         }
         filtered.push(span.clone());
@@ -884,27 +873,36 @@ fn apply_number_exception<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>
     state.add_layer("NumberExceptionAnnotator", filtered);
 }
 
-fn is_exception_no(view: &TextView<'_>, span: &SpanRecord<'_>) -> bool {
-    let value = span.split_value;
-    if value != Some(".") && value != Some("．") {
+fn is_exception_no_parts(
+    view: &TextView<'_>,
+    start: usize,
+    end: usize,
+    is_dot_value: bool,
+) -> bool {
+    if !is_dot_value {
         return false;
     }
-    if span.start < 2 {
+    if start < 2 {
         return false;
     }
-    if span.end >= view.char_len() {
+    if end >= view.char_len() {
         return false;
     }
-    let n_char = view.char_at(span.start - 2).unwrap_or('\0');
-    let o_char = view.char_at(span.start - 1).unwrap_or('\0');
+    let n_char = view.char_at(start - 2).unwrap_or('\0');
+    let o_char = view.char_at(start - 1).unwrap_or('\0');
     if !matches!(n_char, 'N' | 'n' | 'Ｎ' | 'ｎ') {
         return false;
     }
     if !matches!(o_char, 'O' | 'o' | 'Ｏ' | 'ｏ') {
         return false;
     }
-    let next_char = view.char_at(span.end).unwrap_or('\0');
+    let next_char = view.char_at(end).unwrap_or('\0');
     next_char.is_ascii_digit()
+}
+
+#[inline]
+fn is_dot_value(value: Option<&str>) -> bool {
+    matches!(value, Some(".") | Some("．"))
 }
 
 /// Hand-written equivalent of the old `[\n\s]*\n[\n\s]*` regex: a maximal run
@@ -965,6 +963,112 @@ fn apply_linebreak_force<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>)
     }
 
     state.add_layer("LinebreakForceAnnotator", result);
+}
+
+/// Compact span for the boundaries-only fast path used by [`split_sentences`].
+/// Only the fields the downstream rules actually read are kept: the offsets
+/// each exception checks, and a flag for whether the matched text is exactly
+/// `"."` or `"．"` (the sole `split_value` that `NumberException` inspects).
+#[derive(Clone, Copy, Debug)]
+struct Bound {
+    start: usize,
+    end: usize,
+    dot: bool,
+}
+
+#[inline(always)]
+fn merge_bound<'a>(
+    active: &mut Vec<Bound>,
+    seen: &mut HashSet<(usize, usize)>,
+    sr: SpanRecord<'a>,
+) {
+    if seen.insert((sr.start, sr.end)) {
+        active.push(Bound {
+            start: sr.start,
+            end: sr.end,
+            dot: is_dot_value(sr.split_value),
+        });
+    }
+}
+
+/// Compute the final sentence-boundary offsets *without* materialising any
+/// annotation layer — the fast path behind [`split_sentences`].
+///
+/// It runs the exact same rules as [`segment_impl`], but forgoes everything
+/// that exists only to produce the `Layer` records: the cumulative clones in
+/// `add_forward_rule`, the sort for the IndirectQuote layer, and the
+/// `SpanRecord`/`Span` materialisation. The candidate-merge loop mirrors the
+/// first-wins-per-(start,end) semantics of the cumulative forward rules
+/// (including the end-of-text sentinel, which suppresses any same-key rule
+/// span), so the surviving candidate set is exactly the final layer of the
+/// full pipeline — verify with the golden/differential suites.
+pub(crate) fn segment_bounds_only(text: &str) -> Vec<usize> {
+    let view = TextView::new(text);
+    let char_len = view.char_len();
+    let sentinel = Bound {
+        start: if char_len == 0 { 0 } else { char_len - 1 },
+        end: char_len,
+        dot: false,
+    };
+
+    let mut active: Vec<Bound> = Vec::new();
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    seen.insert((sentinel.start, sentinel.end));
+    active.push(sentinel);
+
+    for sr in find_face_marks(&view) {
+        merge_bound(&mut active, &mut seen, sr);
+    }
+    for sr in find_emotion_expressions(&view) {
+        merge_bound(&mut active, &mut seen, sr);
+    }
+    for sr in build_emoji_spans(&view) {
+        merge_bound(&mut active, &mut seen, sr);
+    }
+    for sr in find_basic_rule(&view) {
+        merge_bound(&mut active, &mut seen, sr);
+    }
+
+    active.retain(|c| !is_exception_particle(&view, c.end));
+    active.retain(|c| {
+        !is_exception_numeric(&view, c.start) && !is_exception_mailaddress(&view, c.start)
+    });
+    active.retain(|c| !is_exception_no_parts(&view, c.start, c.end, c.dot));
+    active = apply_linebreak_force_bounds(&view, active);
+
+    let mut ends: Vec<usize> = active.iter().map(|c| c.end).collect();
+    ends.sort_unstable();
+    ends.dedup();
+    ends
+}
+
+fn apply_linebreak_force_bounds(view: &TextView<'_>, mut active: Vec<Bound>) -> Vec<Bound> {
+    let mut map: HashMap<usize, (usize, usize)> = HashMap::new();
+    for (start, end) in find_linebreaks(view) {
+        map.insert(start, (start, end));
+    }
+
+    let mut result: Vec<Bound> = Vec::with_capacity(active.len() + map.len());
+    for c in active.drain(..) {
+        if let Some((lb_start, lb_end)) = map.remove(&c.end) {
+            // Linebreak spans' matched text is never "." / "．".
+            result.push(Bound {
+                start: lb_start,
+                end: lb_end,
+                dot: false,
+            });
+        } else {
+            result.push(c);
+        }
+    }
+    for (_, (start, end)) in map.into_iter() {
+        result.push(Bound {
+            start,
+            end,
+            dot: false,
+        });
+    }
+    result
 }
 
 fn filter_previous_rule_same_span<'a>(
@@ -1092,17 +1196,16 @@ pub fn segment(text: &str) -> Segmentation<'_> {
 /// let sentences = split_sentences("これは一文目。これは二文目。");
 /// assert_eq!(sentences, vec!["これは一文目。", "これは二文目。"]);
 /// ```
-/// Run the full pipeline but only keep the final boundary offsets.
-///
-/// This is the fast path used by [`split_sentences`]: it never materialises
-/// the per-layer span records into owned [`Span`]s, which is where most of the
-/// allocation cost of [`segment`] lives.
+/// Run only the boundary computation, never materialising any per-layer span
+/// records. This is the fast path used by [`split_sentences`]: it forgoes the
+/// cumulative layer bookkeeping, the IndirectQuote sort and the public
+/// `Span`/`Layer` structs, which is where most of the cost of [`segment`] lives.
 pub fn split_sentences(text: &str) -> Vec<&str> {
     split_sentences_impl(text)
 }
 
 fn split_sentences_impl(text: &str) -> Vec<&str> {
-    let boundaries = segment_impl(text).final_boundaries;
+    let boundaries = segment_bounds_only(text);
 
     // `final_boundaries` holds char indices, but we need byte offsets to slice.
     // Walk char_indices once, cutting at each boundary as we go — this avoids
@@ -1152,7 +1255,7 @@ mod tests {
             .iter()
             .find(|span| span.start == 4 && span.end == 6)
             .expect("expected basic rule span");
-        assert!(is_exception_particle(&view, target.start, target.end));
+        assert!(is_exception_particle(&view, target.end));
     }
 
     #[test]
@@ -1199,5 +1302,155 @@ mod tests {
         ];
         let unified = unify_span_annotations(spans);
         assert_eq!(unified.len(), 1);
+    }
+
+    #[test]
+    fn bounds_only_path_matches_full_pipeline() {
+        // The boundaries-only fast path used by split_sentences must produce
+        // the exact final boundaries of the layer-building pipeline. Drive
+        // both over a deterministic corpus hitting every rule interaction.
+        const BITS: &[&str] = &[
+            "日本語文章文字境界判定のための手順検証を行う",
+            "あいうえおかきくけこさしすせそ",
+            "アイウエオカキクケコサシスセソ",
+            "abcXYZ0123456789",
+            "まだ2ヶ月も先だけど。",
+            "早すぎかな(笑)",
+            "楽しみです★",
+            "。",
+            "！",
+            "？",
+            "．",
+            "。",
+            "!?",
+            "なのかな？",
+            "(笑)",
+            "(泣)",
+            "…",
+            "★",
+            "☆",
+            "♪",
+            "…!",
+            "(^_^)",
+            "(*´∀｀*)",
+            "＼(^o^)／",
+            "(^-^)",
+            "(｀・ω・´)",
+            "😀",
+            "😄",
+            "👍",
+            "🎉",
+            "❤️",
+            "😀😀😀",
+            "👍🏽",
+            "👩\u{1F3FC}",
+            "🍺",
+            "🍣",
+            "3.5",
+            "3．5",
+            "No.1",
+            "no.5",
+            "4.5点",
+            "email@example.comは。",
+            "0.5畳",
+            "１．２",
+            "? と",
+            "？って",
+            "。という",
+            "？という",
+            "。て",
+            "？に",
+            "。など",
+            "? くらいでした",
+            "？ もあり",
+            "。ほどでし",
+            "\n",
+            "\n\n",
+            " \n ",
+            "\n\u{3000}\n",
+            "\u{3000}\n",
+            "\u{00A0}",
+            "\t",
+            "\r",
+            "\u{3000}",
+            "(",
+            ")",
+            "（",
+            "）",
+            "「」",
+            "おすすめ度No.1の和室3.5畳はあります。",
+            "スタッフ? と話し込み。",
+            "この値段で、こんな夕飯いいの？\nって、くらいおいしかった！",
+            "宿を予約しました😄まだ2ヶ月も先だけど。",
+            "(近日中には冷房に切り替わる予定です。\nいいですね(泣))",
+            "30代の夫婦2組(男2.女2)です。",
+            "うーん🤔🤔🤔どうしよう",
+        ];
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                z ^ (z >> 31)
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % n as u64) as usize
+            }
+        }
+        let mut rng = Rng(0xDECAFBAD1234);
+        let mut cases: Vec<String> = Vec::new();
+        for _ in 0..5000 {
+            let len = rng.below(10) + 1;
+            let mut s = String::new();
+            for _ in 0..len {
+                s.push_str(BITS[rng.below(BITS.len())]);
+                if rng.below(4) == 0 {
+                    s.push_str(BITS[rng.below(BITS.len())]);
+                }
+            }
+            cases.push(s);
+        }
+        for _ in 0..200 {
+            cases.push(String::new());
+            cases.push("。".into());
+            cases.push("\n".into());
+            cases.push("👍👍👍".into());
+            cases.push("A.B.C".into());
+        }
+        cases.extend(BITS.iter().map(|s| s.to_string()));
+        for a in BITS {
+            for b in BITS {
+                cases.push(format!("{a}{b}"));
+            }
+        }
+        for (i, text) in cases.iter().enumerate() {
+            let via_layers = segment(text).final_boundaries;
+            let via_bounds = segment_bounds_only(text);
+            assert_eq!(
+                via_bounds, via_layers,
+                "case #{i} bounds-only diverges from full pipeline: {text:?}"
+            );
+            // Property check for the slicing: split_sentences must cut exactly
+            // at the pipeline boundaries — lossless, contiguous, and every hard
+            // cut aligned with the next boundary offset.
+            let sentences = split_sentences(text);
+            let mut cum_chars = 0usize;
+            for (k, s) in sentences.iter().enumerate() {
+                cum_chars += s.chars().count();
+                if k + 1 < sentences.len() {
+                    assert_eq!(
+                        cum_chars, via_layers[k],
+                        "split_sentences cut misaligned at case #{i}: {text:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                cum_chars,
+                text.chars().count(),
+                "split_sentences lost/duplicated chars at case #{i}: {text:?}"
+            );
+        }
     }
 }

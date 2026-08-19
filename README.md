@@ -118,27 +118,27 @@ $ cargo bench --bench segment
 ```
 
 Uses [criterion](https://github.com/bheisler/criterion.rs) with the release
-profile (LTO, `codegen-units = 1`). Results for `bunkai_rs` v0.1.0, on the
+profile (LTO, `codegen-units = 1`). Results for `bunkai_rs` v0.1.0+, on the
 built-in Japanese corpus (single thread):
 
 | text size | `segment` | `split_sentences` |
 | --- | ---: | ---: |
-| 61 B (one sentence) | ~1.18 µs | ~1.21 µs |
-| 7 KB (article) | ~58 µs | ~62 µs |
-| 56 KB (long doc) | ~447 µs | ~473 µs |
+| 61 B (one sentence) | ~0.63 µs | ~0.36 µs |
+| 7 KB (article) | ~51 µs | ~43 µs |
+| 56 KB (long doc) | ~417 µs | ~339 µs |
 
-*(Client-facing spans borrow from the input text — all string fields are
-`&'static str` / `&str` slices — so `segment` allocates no per-span strings and
-is typically on par with `split_sentences`.)*
+*`segment` materialises every pipeline layer, so it is naturally a bit more
+expensive than `split_sentences`, which runs only the boundary computation over
+a compact representation — no per-layer span records, no IndirectQuote sort.*
 
 Relative to the original regex/HashMap port, the optimisation pass makes
-`segment` ~2.5× faster and `split_sentences` ~1.1× faster on the 7 KB corpus. It
-removes the per-span `String` allocations (the public `Span`/`Layer`/
-`Segmentation` now borrow their string fields from the input instead of owning
-them), hand-writes the two regular expressions and the emoji-table lookup
-(which also drops the `regex` and `once_cell` dependencies and skips the whole
-CJK/kanji range in the emoji scan), and gives `split_sentences` a fast path that
-ever materialises the per-layer `Span` records.
+`segment` ~2.9× faster and `split_sentences` ~1.6× faster on the 7 KB corpus.
+The borrow-based `Span`/`Layer`/`Segmentation` (no per-span `String`
+allocations), hand-written scanners for the two regular expressions and the
+emoji-table lookup (dropping the `regex` and `once_cell` dependencies, skipping
+the CJK/kanji range in the emoji scan), direct construction of the unique
+IndirectQuote span set (no cross-layer re-collection), and the
+boundaries-only `split_sentences` fast path are the main contributors.
 
 ## License
 
