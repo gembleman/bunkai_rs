@@ -417,6 +417,29 @@ const fn first_ge(data: &[(u32, Option<&'static str>)], threshold: u32) -> usize
 const EMOJI_LOW_END: usize = first_ge(emoji_data::EMOJI_DATA, 0x3300);
 const EMOJI_HIGH_START: usize = first_ge(emoji_data::EMOJI_DATA, 0x1F000);
 
+/// Direct-indexed lookup for the plane-1 emoji block: `EMOJI_HIGH_LOOKUP[cp -
+/// 0x1F000]` is the codepoint's index into `EMOJI_DATA`, or `u16::MAX` if the
+/// codepoint isn't in the table. Replaces an ~11-iteration binary search (a
+/// dependent-load chain with a ~50%-mispredicted data-dependent branch) with a
+/// single address-known load. The plane-1 block is dense (1230 entries over
+/// ~2.8K codepoints) so the table is small (~5.6 KB) and `u16` comfortably
+/// indexes `EMOJI_DATA` (1400 entries, `EMOJI_DATA.len() < u16::MAX`).
+const EMOJI_HIGH_SPAN: usize =
+    (emoji_data::EMOJI_DATA[emoji_data::EMOJI_DATA.len() - 1].0 - 0x1F000 + 1) as usize;
+const EMOJI_HIGH_LOOKUP: [u16; EMOJI_HIGH_SPAN] = build_emoji_high_lookup();
+const fn build_emoji_high_lookup() -> [u16; EMOJI_HIGH_SPAN] {
+    let data = emoji_data::EMOJI_DATA;
+    let mut table = [u16::MAX; EMOJI_HIGH_SPAN];
+    let mut i = EMOJI_HIGH_START;
+    while i < data.len() {
+        let slot = (data[i].0 - 0x1F000) as usize;
+        table[slot] = i as u16;
+        i += 1;
+    }
+    table
+}
+const _: () = assert!(emoji_data::EMOJI_DATA.len() < u16::MAX as usize);
+
 /// A hand-written lower-bound loop instead of `slice::binary_search_by_key`
 /// so the whole lookup inlines into the scanning hot loop.
 #[inline]
@@ -430,28 +453,39 @@ fn emoji_lookup(codepoint: u32) -> Option<&'static Option<&'static str>> {
         return None;
     }
     let data = emoji_data::EMOJI_DATA;
-    let (mut lo, mut hi) = if codepoint < 0x3300 {
-        (0usize, EMOJI_LOW_END)
-    } else if codepoint < 0x1F000 {
+    if codepoint < 0x3300 {
+        let (mut lo, mut hi) = (0usize, EMOJI_LOW_END);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if data[mid].0 < codepoint {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return if lo < data.len() && data[lo].0 == codepoint {
+            Some(&data[lo].1)
+        } else {
+            None
+        };
+    }
+    if codepoint < 0x1F000 {
         // The entire CJK/kanji range is emoji-free — this is the hot path
         // for ordinary Japanese prose.
         debug_assert_eq!(EMOJI_LOW_END, EMOJI_HIGH_START);
         return None;
-    } else {
-        (EMOJI_HIGH_START, data.len())
-    };
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if data[mid].0 < codepoint {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
     }
-    if lo < data.len() && data[lo].0 == codepoint {
-        Some(&data[lo].1)
-    } else {
+    // Plane-1 block: direct-indexed, no dependent-load binary search (see
+    // `EMOJI_HIGH_LOOKUP`).
+    let slot = (codepoint - 0x1F000) as usize;
+    if slot >= EMOJI_HIGH_LOOKUP.len() {
+        return None;
+    }
+    let idx = EMOJI_HIGH_LOOKUP[slot];
+    if idx == u16::MAX {
         None
+    } else {
+        Some(&data[idx as usize].1)
     }
 }
 const _: () = assert!(EMOJI_LOW_END == EMOJI_HIGH_START);
@@ -1240,8 +1274,14 @@ fn scan_bounds_bytes(text: &str, active: &mut Vec<Bound>, linebreaks: &mut Vec<(
     let len = bytes.len();
     let mut b = 0usize;
     let mut prev: Option<char> = None;
+    // Caches `prev.is_some_and(|p| emoji_lookup(p as u32).is_some())` so the
+    // dispatch doesn't re-run `emoji_lookup` on `prev` every iteration: none
+    // of the punctuation/kaomoji trigger chars matched by the other arms are
+    // in `EMOJI_DATA`, so `is_emoji` is exactly that predicate for every `ch`.
+    let mut prev_is_emoji = false;
     while b < len {
         let (ch, n) = char_at_byte(bytes, b);
+        let mut is_emoji = false;
         match ch {
             '(' | '（' => {
                 scan_emotion_word_bytes(bytes, len, b, n, active);
@@ -1258,8 +1298,9 @@ fn scan_bounds_bytes(text: &str, active: &mut Vec<Bound>, linebreaks: &mut Vec<(
                 }
             }
             _ => {
-                if emoji_lookup(ch as u32).is_some() {
-                    if !prev.is_some_and(|p| emoji_lookup(p as u32).is_some()) {
+                is_emoji = emoji_lookup(ch as u32).is_some();
+                if is_emoji {
+                    if !prev_is_emoji {
                         scan_emoji_run_bytes(bytes, len, b, active);
                     }
                 } else if is_ws(ch) {
@@ -1287,6 +1328,7 @@ fn scan_bounds_bytes(text: &str, active: &mut Vec<Bound>, linebreaks: &mut Vec<(
             }
         }
         prev = Some(ch);
+        prev_is_emoji = is_emoji;
         b += n;
     }
 }
@@ -1351,7 +1393,10 @@ fn scan_emoji_run_bytes(bytes: &[u8], len: usize, start: usize, active: &mut Vec
         let Some(category) = emoji_lookup(c as u32).copied() else {
             break;
         };
-        if category.is_some_and(|cat| TARGET_EMOJI_CATEGORIES.contains(&cat)) {
+        // Run-end detection (the `break` above) still needs every char
+        // visited, but once a target category is found there's no need to
+        // keep re-checking `TARGET_EMOJI_CATEGORIES.contains` on the rest.
+        if !any_target && category.is_some_and(|cat| TARGET_EMOJI_CATEGORIES.contains(&cat)) {
             any_target = true;
         }
         j += n;
