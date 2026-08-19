@@ -444,6 +444,9 @@ enum Kind {
     Emotion,
     Emoji,
     Basic,
+    /// A whitespace run containing a newline (linebreak). Collected separately:
+    /// it is only ever turned into (start,end) spans by the Linebreak stage.
+    Linebreak,
 }
 
 impl Kind {
@@ -453,6 +456,7 @@ impl Kind {
             Kind::Emotion => "EmotionExpressionAnnotator",
             Kind::Emoji => "EmojiAnnotator",
             Kind::Basic => "BasicRule",
+            Kind::Linebreak => "LinebreakForceAnnotator",
         }
     }
 
@@ -480,10 +484,16 @@ struct SpanCollector<'v, 'a> {
     emotion: Vec<SpanRecord<'a>>,
     emoji: Vec<SpanRecord<'a>>,
     basic: Vec<SpanRecord<'a>>,
+    /// Newline whitespace runs, in scan order (linebreak spans).
+    linebreaks: Vec<(usize, usize)>,
 }
 
 impl<'v, 'a> Emit for SpanCollector<'v, 'a> {
     fn emit(&mut self, kind: Kind, start: usize, end: usize) {
+        if let Kind::Linebreak = kind {
+            self.linebreaks.push((start, end));
+            return;
+        }
         let record = SpanRecord {
             rule_name: kind.rule_name(),
             start,
@@ -496,6 +506,7 @@ impl<'v, 'a> Emit for SpanCollector<'v, 'a> {
             Kind::Emotion => self.emotion.push(record),
             Kind::Emoji => self.emoji.push(record),
             Kind::Basic => self.basic.push(record),
+            Kind::Linebreak => unreachable!(),
         }
     }
 }
@@ -505,6 +516,7 @@ struct ScanAll<'a> {
     emotion: Vec<SpanRecord<'a>>,
     emoji: Vec<SpanRecord<'a>>,
     basic: Vec<SpanRecord<'a>>,
+    linebreaks: Vec<(usize, usize)>,
 }
 
 /// Layer-path entry point: run the fused scanner into grouped `SpanRecord`s.
@@ -515,6 +527,7 @@ fn scan_all<'a>(view: &TextView<'a>) -> ScanAll<'a> {
         emotion: Vec::new(),
         emoji: Vec::new(),
         basic: Vec::new(),
+        linebreaks: Vec::new(),
     };
     scan_all_with(&view.chars, &mut collector);
     ScanAll {
@@ -522,6 +535,7 @@ fn scan_all<'a>(view: &TextView<'a>) -> ScanAll<'a> {
         emotion: collector.emotion,
         emoji: collector.emoji,
         basic: collector.basic,
+        linebreaks: collector.linebreaks,
     }
 }
 
@@ -565,6 +579,30 @@ fn scan_all_with<E: Emit>(chars: &[char], out: &mut E) {
         if emoji_lookup(ch as u32).is_some() {
             if i == 0 || emoji_lookup(chars[i - 1] as u32).is_none() {
                 scan_emoji_run(chars, len, i, out);
+            }
+            i += 1;
+            continue;
+        }
+        if is_ws(ch) {
+            // Linebreak detection, folded into the same pass: a whitespace run
+            // is visited at its start only, and recorded iff it contains a
+            // newline (the old separate `find_linebreaks` pass scanned every
+            // position again for this). This is independent of the basic-rule
+            // trailing-whitespace consumption in the original code, matching
+            // the two separate passes exactly.
+            if i == 0 || !is_ws(chars[i - 1]) {
+                let start = i;
+                let mut j = i;
+                let mut has_newline = false;
+                while j < len && is_ws(chars[j]) {
+                    if chars[j] == '\n' {
+                        has_newline = true;
+                    }
+                    j += 1;
+                }
+                if has_newline {
+                    out.emit(Kind::Linebreak, start, j);
+                }
             }
             i += 1;
             continue;
@@ -733,7 +771,7 @@ pub(crate) fn segment_impl(text: &str) -> PipelineOutput<'_> {
     apply_number_exception(&view, &mut state);
     prof::end();
     prof::begin("LinebreakForce");
-    apply_linebreak_force(&view, &mut state);
+    apply_linebreak_force(&view, &mut state, &scan.linebreaks);
     prof::end();
 
     prof::begin("into_output");
@@ -971,33 +1009,13 @@ fn is_dot_value(value: Option<&str>) -> bool {
 
 /// Hand-written equivalent of the old `[\n\s]*\n[\n\s]*` regex: a maximal run
 /// of Unicode whitespace that contains at least one newline.
-fn find_linebreaks(view: &TextView<'_>) -> Vec<(usize, usize)> {
-    let mut out: Vec<(usize, usize)> = Vec::new();
-    let len = view.char_len();
-    let mut i = 0usize;
-    while i < len {
-        if !is_ws(view.char_at(i).unwrap_or('\0')) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        let mut has_newline = false;
-        while i < len && is_ws(view.char_at(i).unwrap_or('\0')) {
-            if view.char_at(i) == Some('\n') {
-                has_newline = true;
-            }
-            i += 1;
-        }
-        if has_newline {
-            out.push((start, i));
-        }
-    }
-    out
-}
-
-fn apply_linebreak_force<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) {
+fn apply_linebreak_force<'a>(
+    view: &TextView<'a>,
+    state: &mut PipelineState<'a>,
+    linebreaks: &[(usize, usize)],
+) {
     let mut map: HashMap<usize, (usize, usize)> = HashMap::new();
-    for (start, end) in find_linebreaks(view) {
+    for &(start, end) in linebreaks {
         map.insert(start, (start, end));
     }
 
@@ -1048,10 +1066,16 @@ struct BoundMerger<'a> {
     active: &'a mut Vec<Bound>,
     seen: &'a mut HashSet<(usize, usize)>,
     chars: &'a [char],
+    /// Newline whitespace runs, in scan order (linebreak spans).
+    linebreaks: Vec<(usize, usize)>,
 }
 
 impl Emit for BoundMerger<'_> {
-    fn emit(&mut self, _kind: Kind, start: usize, end: usize) {
+    fn emit(&mut self, kind: Kind, start: usize, end: usize) {
+        if let Kind::Linebreak = kind {
+            self.linebreaks.push((start, end));
+            return;
+        }
         if self.seen.insert((start, end)) {
             // A span whose whole matched text is "." / "．" iff it spans exactly
             // that single character — equivalent to `split_value == "."`/`"．"`.
@@ -1085,21 +1109,23 @@ pub(crate) fn segment_bounds_only(text: &str) -> Vec<usize> {
     seen.insert((sentinel.start, sentinel.end));
     active.push(sentinel);
 
-    {
+    let linebreaks = {
         let mut merger = BoundMerger {
             active: &mut active,
             seen: &mut seen,
             chars: &view.chars,
+            linebreaks: Vec::new(),
         };
         scan_all_with(&view.chars, &mut merger);
-    }
+        merger.linebreaks
+    };
 
     active.retain(|c| !is_exception_particle(&view, c.end));
     active.retain(|c| {
         !is_exception_numeric(&view, c.start) && !is_exception_mailaddress(&view, c.start)
     });
     active.retain(|c| !is_exception_no_parts(&view, c.start, c.end, c.dot));
-    active = apply_linebreak_force_bounds(&view, active);
+    active = apply_linebreak_force_bounds(active, &linebreaks);
 
     let mut ends: Vec<usize> = active.iter().map(|c| c.end).collect();
     ends.sort_unstable();
@@ -1107,9 +1133,12 @@ pub(crate) fn segment_bounds_only(text: &str) -> Vec<usize> {
     ends
 }
 
-fn apply_linebreak_force_bounds(view: &TextView<'_>, mut active: Vec<Bound>) -> Vec<Bound> {
+fn apply_linebreak_force_bounds(
+    mut active: Vec<Bound>,
+    linebreaks: &[(usize, usize)],
+) -> Vec<Bound> {
     let mut map: HashMap<usize, (usize, usize)> = HashMap::new();
-    for (start, end) in find_linebreaks(view) {
+    for &(start, end) in linebreaks {
         map.insert(start, (start, end));
     }
 
@@ -1844,10 +1873,37 @@ mod tests {
             let old_emotion = old_find_emotion_expressions(&view);
             let old_emoji = old_build_emoji_spans(&view);
             let old_basic = old_find_basic_rule(&view);
+            let old_lb = old_find_linebreaks(&view);
             assert_eq!(scan.face, old_face, "case {i} face: {text:?}");
             assert_eq!(scan.emotion, old_emotion, "case {i} emotion: {text:?}");
             assert_eq!(scan.emoji, old_emoji, "case {i} emoji: {text:?}");
             assert_eq!(scan.basic, old_basic, "case {i} basic: {text:?}");
+            assert_eq!(scan.linebreaks, old_lb, "case {i} linebreaks: {text:?}");
         }
+    }
+
+    /// The linebreak pass before it was folded into the fused scanner.
+    fn old_find_linebreaks(view: &TextView<'_>) -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        let len = view.char_len();
+        let mut i = 0usize;
+        while i < len {
+            if !is_ws(view.char_at(i).unwrap_or('\0')) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            let mut has_newline = false;
+            while i < len && is_ws(view.char_at(i).unwrap_or('\0')) {
+                if view.char_at(i) == Some('\n') {
+                    has_newline = true;
+                }
+                i += 1;
+            }
+            if has_newline {
+                out.push((start, i));
+            }
+        }
+        out
     }
 }
