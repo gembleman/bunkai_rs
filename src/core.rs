@@ -266,6 +266,16 @@ impl<'a> PipelineState<'a> {
         &self.layers[self.final_index].spans
     }
 
+    fn final_spans_mut(&mut self) -> &mut Vec<SpanRecord<'a>> {
+        &mut self.layers[self.final_index].spans
+    }
+
+    /// Rename the current (final) layer. Used by the exception stages, which
+    /// filter the cumulative layer in place instead of building a fresh one.
+    fn rename_final_layer(&mut self, name: &'static str) {
+        self.layers[self.final_index].name = name;
+    }
+
     fn add_layer(&mut self, name: &'static str, spans: Vec<SpanRecord<'a>>) {
         let idx = self.layers.len();
         self.layers.push(LayerOutput { name, spans });
@@ -440,10 +450,57 @@ const fn build_emoji_high_lookup() -> [u16; EMOJI_HIGH_SPAN] {
 }
 const _: () = assert!(emoji_data::EMOJI_DATA.len() < u16::MAX as usize);
 
+/// `&str` equality usable in a `const` context (`PartialEq` for `str` is not
+/// yet const-stable). Used to precompute `EMOJI_TARGET` against the
+/// `TARGET_EMOJI_CATEGORIES` strings.
+const fn str_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    let mut i = 0;
+    while i < ab.len() {
+        if ab[i] != bb[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Per-`EMOJI_DATA`-index target flag: 1 iff the emoji's category is one of
+/// `TARGET_EMOJI_CATEGORIES`. Precomputed so the hot emoji-run scan does a
+/// single `bool` test instead of a `&str` byte comparison (opportunity (5) in
+/// `docs/optimization-hardware.md`). `EMOJI_DATA`'s `&str` categories stay
+/// untouched — they are still used by the spec model and the low/high lookups.
+const EMOJI_TARGET: [u8; emoji_data::EMOJI_DATA.len()] = {
+    let mut arr = [0u8; emoji_data::EMOJI_DATA.len()];
+    let mut i = 0;
+    while i < emoji_data::EMOJI_DATA.len() {
+        if let Some(c) = emoji_data::EMOJI_DATA[i].1 {
+            let mut k = 0;
+            while k < TARGET_EMOJI_CATEGORIES.len() {
+                if str_eq(c, TARGET_EMOJI_CATEGORIES[k]) {
+                    arr[i] = 1;
+                    break;
+                }
+                k += 1;
+            }
+        }
+        i += 1;
+    }
+    arr
+};
+
 /// A hand-written lower-bound loop instead of `slice::binary_search_by_key`
 /// so the whole lookup inlines into the scanning hot loop.
+///
+/// Returns `(category, is_target)`: `category` is the emoji's `&str` group (or
+/// `None`), and `is_target` is the precomputed `category ∈ TARGET_EMOJI_CATEGORIES`
+/// flag so callers avoid a `&str` byte comparison on the hot path.
 #[inline]
-fn emoji_lookup(codepoint: u32) -> Option<&'static Option<&'static str>> {
+fn emoji_lookup(codepoint: u32) -> Option<(Option<&'static str>, bool)> {
     // Fast reject for the dominant emoji-free Japanese ranges: kana (hiragana
     // + katakana) and the katakana phonetic extensions sit below 0x3300, so
     // they would otherwise fall into the ~170-entry low-block binary search on
@@ -464,7 +521,7 @@ fn emoji_lookup(codepoint: u32) -> Option<&'static Option<&'static str>> {
             }
         }
         return if lo < data.len() && data[lo].0 == codepoint {
-            Some(&data[lo].1)
+            Some((data[lo].1, EMOJI_TARGET[lo] == 1))
         } else {
             None
         };
@@ -485,7 +542,7 @@ fn emoji_lookup(codepoint: u32) -> Option<&'static Option<&'static str>> {
     if idx == u16::MAX {
         None
     } else {
-        Some(&data[idx as usize].1)
+        Some((data[idx as usize].1, EMOJI_TARGET[idx as usize] == 1))
     }
 }
 const _: () = assert!(EMOJI_LOW_END == EMOJI_HIGH_START);
@@ -744,16 +801,13 @@ fn scan_emotion_symbol_run<E: Emit>(chars: &[char], len: usize, i: usize, out: &
 fn scan_emoji_run<E: Emit>(chars: &[char], len: usize, i: usize, out: &mut E) {
     let start = i;
     let mut j = i;
-    let mut any_target = emoji_lookup(chars[j] as u32)
-        .copied()
-        .flatten()
-        .is_some_and(|cat| TARGET_EMOJI_CATEGORIES.contains(&cat));
+    let mut any_target = emoji_lookup(chars[j] as u32).is_some_and(|(_, t)| t);
     j += 1;
     while j < len {
-        let Some(category) = emoji_lookup(chars[j] as u32).copied() else {
+        let Some((_, is_target)) = emoji_lookup(chars[j] as u32) else {
             break;
         };
-        if category.is_some_and(|cat| TARGET_EMOJI_CATEGORIES.contains(&cat)) {
+        if is_target {
             any_target = true;
         }
         j += 1;
@@ -844,32 +898,23 @@ pub(crate) fn segment_impl(text: &str) -> PipelineOutput<'_> {
 
 fn apply_indirect_quote<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) {
     prof::begin("i.unify");
-    // `final_spans()` (the BasicRule layer) already holds the *unique* union
-    // of every earlier annotator layer's spans (FaceMark + Emotion + Emoji +
-    // BasicRule) and the end-of-text sentinel, because each `add_forward_rule`
-    // re-includes the previous layer's spans. The old `INDIRECT_RULE_TARGETS`
-    // sweep only re-collected those same records a few times over (every
-    // target layer is cumulative), then relied on `unify_span_annotations` to
-    // sort+dedup the redundancy away. Build the unique set directly.
-    let mut spans: Vec<SpanRecord<'_>> = Vec::with_capacity(state.final_spans().len());
-    for span in state.final_spans() {
-        if is_exception_particle(view, span.end as usize) {
-            continue;
-        }
-        spans.push(span.clone());
-    }
-    // (start,end) is unique in the source layer (`filter_previous_rule_same_span`
-    // keeps at most one record per key) and the exception filter only removes
-    // records, so there are no equal sort keys: an unstable sort cannot differ
-    // from the previous stable one, and it avoids the merge-sort temp buffer.
-    spans.sort_unstable_by(|a, b| a.start.cmp(&b.start).then(a.end.cmp(&b.end)));
+    // The final layer is already sorted by `(start, end)` — maintained by the
+    // merge in `filter_previous_rule_same_span` — so filtering in place keeps
+    // it sorted and the old `sort_unstable_by` (the dominant cost of this
+    // stage) is no longer needed. `retain` only memmoves survivors within the
+    // one buffer, dropping the per-record clone the old `Vec::push(span.clone())`
+    // did.
+    state.final_spans_mut().retain(|span| {
+        !is_exception_particle(view, span.end as usize)
+    });
     debug_assert!(
-        spans
+        state
+            .final_spans()
             .windows(2)
             .all(|w| w[0].start != w[1].start || w[0].end != w[1].end)
     );
     prof::end();
-    state.add_layer("IndirectQuoteExceptionAnnotator", spans);
+    state.rename_final_layer("IndirectQuoteExceptionAnnotator");
 }
 
 fn is_exception_particle(view: &TextView<'_>, end: usize) -> bool {
@@ -937,16 +982,13 @@ fn unify_span_annotations(spans: Vec<SpanRecord<'_>>) -> Vec<SpanRecord<'_>> {
 }
 
 fn apply_dot_exception<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) {
-    let mut filtered: Vec<SpanRecord<'_>> = Vec::with_capacity(state.final_spans().len());
-    for span in state.final_spans().iter() {
-        if is_exception_numeric(view, span.start as usize)
-            || is_exception_mailaddress(view, span.start as usize)
-        {
-            continue;
-        }
-        filtered.push(span.clone());
-    }
-    state.add_layer("DotExceptionAnnotator", filtered);
+    // Filter in place: the cumulative layer is already `(start, end)`-sorted,
+    // so `retain` preserves that order (no re-sort, no per-record clone).
+    state.final_spans_mut().retain(|span| {
+        !(is_exception_numeric(view, span.start as usize)
+            || is_exception_mailaddress(view, span.start as usize))
+    });
+    state.rename_final_layer("DotExceptionAnnotator");
 }
 
 fn is_exception_numeric(view: &TextView<'_>, index: usize) -> bool {
@@ -1028,19 +1070,15 @@ fn is_mail_char(ch: char) -> bool {
 }
 
 fn apply_number_exception<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) {
-    let mut filtered: Vec<SpanRecord<'_>> = Vec::with_capacity(state.final_spans().len());
-    for span in state.final_spans().iter() {
-        if is_exception_no_parts(
+    state.final_spans_mut().retain(|span| {
+        !is_exception_no_parts(
             view,
             span.start as usize,
             span.end as usize,
             is_dot_value(span.split_value),
-        ) {
-            continue;
-        }
-        filtered.push(span.clone());
-    }
-    state.add_layer("NumberExceptionAnnotator", filtered);
+        )
+    });
+    state.rename_final_layer("NumberExceptionAnnotator");
 }
 
 fn is_exception_no_parts(
@@ -1082,35 +1120,37 @@ fn apply_linebreak_force<'a>(
     state: &mut PipelineState<'a>,
     linebreaks: &[(usize, usize)],
 ) {
-    let mut map: HashMap<usize, (usize, usize)> = HashMap::new();
-    for &(start, end) in linebreaks {
-        map.insert(start, (start, end));
-    }
+    let mut map: HashMap<usize, (usize, usize)> = linebreaks
+        .iter()
+        .map(|&(start, end)| (start, (start, end)))
+        .collect();
 
-    let mut result: Vec<SpanRecord<'_>> = Vec::with_capacity(state.final_spans().len() + map.len());
-    for span in state.final_spans().iter() {
-        if let Some((lb_start, lb_end)) = map.remove(&(span.end as usize)) {
-            result.push(SpanRecord {
+    // 1:1 transform: each final span is either kept (in place) or replaced by
+    // the linebreak run whose start equals its end; unmatched linebreaks are
+    // appended after. This overwrites the buffer in place instead of cloning
+    // every kept span into a fresh `Vec`.
+    {
+        let spans = state.final_spans_mut();
+        for span in spans.iter_mut() {
+            if let Some((lb_start, lb_end)) = map.remove(&(span.end as usize)) {
+                *span = SpanRecord {
+                    kind: Kind::Linebreak,
+                    start: lb_start as u32,
+                    end: lb_end as u32,
+                    split_value: Some(view.slice(lb_start, lb_end)),
+                };
+            }
+        }
+        for (_, (start, end)) in map {
+            spans.push(SpanRecord {
                 kind: Kind::Linebreak,
-                start: lb_start as u32,
-                end: lb_end as u32,
-                split_value: Some(view.slice(lb_start, lb_end)),
+                start: start as u32,
+                end: end as u32,
+                split_value: Some(view.slice(start, end)),
             });
-        } else {
-            result.push(span.clone());
         }
     }
-
-    for (_, (start, end)) in map.into_iter() {
-        result.push(SpanRecord {
-            kind: Kind::Linebreak,
-            start: start as u32,
-            end: end as u32,
-            split_value: Some(view.slice(start, end)),
-        });
-    }
-
-    state.add_layer("LinebreakForceAnnotator", result);
+    state.rename_final_layer("LinebreakForceAnnotator");
 }
 
 /// Compact span for the boundaries-only fast path used by [`split_sentences`].
@@ -1390,13 +1430,10 @@ fn scan_emoji_run_bytes(bytes: &[u8], len: usize, start: usize, active: &mut Vec
     let mut any_target = false;
     while j < len {
         let (c, n) = char_at_byte(bytes, j);
-        let Some(category) = emoji_lookup(c as u32).copied() else {
+        let Some((_, is_target)) = emoji_lookup(c as u32) else {
             break;
         };
-        // Run-end detection (the `break` above) still needs every char
-        // visited, but once a target category is found there's no need to
-        // keep re-checking `TARGET_EMOJI_CATEGORIES.contains` on the rest.
-        if !any_target && category.is_some_and(|cat| TARGET_EMOJI_CATEGORIES.contains(&cat)) {
+        if is_target {
             any_target = true;
         }
         j += n;
@@ -1674,16 +1711,44 @@ fn filter_previous_rule_same_span<'a>(
     previous: &[SpanRecord<'a>],
     sentinel_key: (usize, usize),
 ) -> Vec<SpanRecord<'a>> {
-    let mut filtered: Vec<SpanRecord<'_>> = Vec::with_capacity(current.len() + previous.len());
-    for span in current {
-        if (span.start as usize, span.end as usize) == sentinel_key {
-            continue;
+    // Both inputs are sorted by `(start, end)`:
+    //  • `current` is one rule's hits in scan order, which is start order;
+    //  • `previous` is the cumulative layer, kept sorted by this same merge.
+    // Merging instead of concatenating keeps the cumulative layer sorted, so
+    // `apply_indirect_quote`'s later sort sees already-sorted data (pdqsort
+    // then runs in ~O(n)). The sentinel (key == `sentinel_key`) lives only in
+    // `previous`, sorts to the tail (largest position), and survives exactly
+    // once — matching the old `current-filtered ++ previous` shape.
+    let mut out: Vec<SpanRecord<'a>> = Vec::with_capacity(current.len() + previous.len());
+    let mut ci = current.into_iter().peekable();
+    let mut pi = 0usize;
+    while pi < previous.len() || ci.peek().is_some() {
+        match (ci.peek(), previous.get(pi)) {
+            (Some(c), Some(p)) => {
+                if (c.start, c.end) <= (p.start, p.end) {
+                    if (c.start as usize, c.end as usize) != sentinel_key {
+                        out.push(c.clone());
+                    }
+                    ci.next();
+                } else {
+                    out.push(p.clone());
+                    pi += 1;
+                }
+            }
+            (Some(c), None) => {
+                if (c.start as usize, c.end as usize) != sentinel_key {
+                    out.push(c.clone());
+                }
+                ci.next();
+            }
+            (None, Some(p)) => {
+                out.push(p.clone());
+                pi += 1;
+            }
+            (None, None) => break,
         }
-        filtered.push(span);
     }
-
-    filtered.extend(previous.iter().cloned());
-    filtered
+    out
 }
 
 /// A single annotated span produced by one of the pipeline rules.
@@ -1768,8 +1833,13 @@ impl<'a> From<PipelineOutput<'a>> for Segmentation<'a> {
 /// assert_eq!(seg.layers.last().unwrap().name, "LinebreakForceAnnotator");
 /// ```
 pub fn segment(text: &str) -> Segmentation<'_> {
+    // Measure only the `PipelineOutput → Segmentation` conversion here. The
+    // `segment_impl` stages are timed inside `segment_impl` itself and folded
+    // there, so wrapping them in this frame would double-count the whole
+    // pipeline under the "materialize" tag.
+    let output = segment_impl(text);
     prof::begin("materialize");
-    let seg: Segmentation<'_> = segment_impl(text).into();
+    let seg: Segmentation<'_> = output.into();
     prof::end();
     prof::on_segment_done();
     seg
@@ -2239,18 +2309,18 @@ mod tests {
             // Skip plain characters; a run starts on an emoji codepoint. Table
             // membership is what matters — "emoji" includes codepoints whose
             // stored category is `None`, e.g. skin-tone modifiers.
-            let Some(first) = emoji_lookup(view.chars[i] as u32).copied() else {
+            let Some((_, first_target)) = emoji_lookup(view.chars[i] as u32) else {
                 i += 1;
                 continue;
             };
             let start = i;
-            let mut any_target = first.is_some_and(|cat| TARGET_EMOJI_CATEGORIES.contains(&cat));
+            let mut any_target = first_target;
             i += 1;
             while i < len {
-                let Some(category) = emoji_lookup(view.chars[i] as u32).copied() else {
+                let Some((_, is_target)) = emoji_lookup(view.chars[i] as u32) else {
                     break;
                 };
-                if category.is_some_and(|cat| TARGET_EMOJI_CATEGORIES.contains(&cat)) {
+                if is_target {
                     any_target = true;
                 }
                 i += 1;
