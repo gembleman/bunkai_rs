@@ -1103,7 +1103,7 @@ struct Bound {
 /// make the surviving set exactly the final layer's boundaries re-expressed in
 /// bytes — verified by the golden/differential suites and the
 /// bounds-vs-pipeline property test.
-pub(crate) fn sentence_byte_boundaries(text: &str) -> Vec<usize> {
+pub fn sentence_byte_boundaries(text: &str) -> Vec<usize> {
     let len = text.len();
     let mut active: Vec<Bound> = Vec::new();
     let mut linebreaks: Vec<(usize, usize)> = Vec::new();

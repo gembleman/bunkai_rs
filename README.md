@@ -98,11 +98,13 @@ The algorithm is specified mathematically in [`docs/spec.md`](docs/spec.md):
 character-class predicates, every rule as a set comprehension over maximal
 runs, the exception filters, and the boundary set `B(s)` — with proofs of
 well-formedness, the first-wins priority lemma, the linebreak-replacement
-formula and lossless segmentation. `src/spec_model.rs` (test-only) is an
-independent, deliberately naive transcription of *those formulas* — no shared
-code with `core.rs` — and the test suite verifies model ≡ pipeline ≡ fast path
-≡ Python-derived reference over 15,423 strings (11,550 generated + 3,388
-golden + 485 differential), plus the theorem checks.
+formula and lossless segmentation. `src/bin/spec_model.rs`, an independent,
+standalone binary (no shared code with `core.rs`), is a deliberately naive
+transcription of *those formulas*; it can be run directly
+(`cargo run --bin spec_model`) or as `#[test]`s (`cargo test --bin spec_model`).
+It verifies model ≡ pipeline ≡ fast path ≡ Python-derived reference over
+15,423 strings (11,550 generated + 3,388 golden + 485 differential), plus the
+theorem checks.
 
 ## Trade-offs vs. the original Python
 
@@ -150,6 +152,13 @@ The suite includes:
   ```
   (no extra dependencies; it materialises the original sources from `git HEAD`
   into a scratch crate and runs them).
+* `src/bin/spec_model.rs` — the **formal-spec verifier** (see
+  [Formal specification & verification](#formal-specification--verification)).
+  A standalone binary, transcribed independently of `core.rs`, that checks the
+  model against the pipeline, the fast byte path and the Python-derived
+  golden/differential corpora, plus the theorem checks. Run it directly with
+  `cargo run --bin spec_model`, or as targeted tests with
+  `cargo test --bin spec_model`.
 
 ## Benchmark
 
