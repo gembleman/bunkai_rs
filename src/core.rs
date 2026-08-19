@@ -220,12 +220,15 @@ fn is_ws(ch: char) -> bool {
     )
 }
 
+/// Internal pipeline record, kept deliberately compact: a 1-byte rule kind plus
+/// two 32-bit offsets and the borrowed split text — 32 bytes per record, half
+/// of the old 64 with the two `&'static str` fields. The layer path carries
+/// these in cumulative copies, so halving the record halves that memcpy volume.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SpanRecord<'a> {
-    pub(crate) rule_name: &'static str,
-    pub(crate) start: usize,
-    pub(crate) end: usize,
-    pub(crate) split_type: Option<&'static str>,
+    kind: Kind,
+    pub(crate) start: u32,
+    pub(crate) end: u32,
     pub(crate) split_value: Option<&'a str>,
 }
 
@@ -244,10 +247,9 @@ impl<'a> PipelineState<'a> {
     fn new(char_len: usize) -> Self {
         let sentinel_start = if char_len == 0 { 0 } else { char_len - 1 };
         let sentinel = SpanRecord {
-            rule_name: "first",
-            start: sentinel_start,
-            end: char_len,
-            split_type: None,
+            kind: Kind::Sentinel,
+            start: sentinel_start as u32,
+            end: char_len as u32,
             split_value: None,
         };
         let layer = LayerOutput {
@@ -275,7 +277,7 @@ impl<'a> PipelineState<'a> {
         // the very last position can collide with — see filter_previous_rule_same_span.
         let (sstart, send) = {
             let s = &self.layers[0].spans[0];
-            (s.start, s.end)
+            (s.start as usize, s.end as usize)
         };
         let filtered = filter_previous_rule_same_span(spans, self.final_spans(), (sstart, send));
         self.add_layer(name, filtered);
@@ -284,7 +286,7 @@ impl<'a> PipelineState<'a> {
     fn into_output(self) -> PipelineOutput<'a> {
         let mut bounds: Vec<usize> = Vec::with_capacity(self.layers[self.final_index].spans.len());
         for span in &self.layers[self.final_index].spans {
-            bounds.push(span.end);
+            bounds.push(span.end as usize);
         }
         bounds.sort_unstable();
         bounds.dedup();
@@ -305,8 +307,9 @@ pub(crate) struct TextView<'a> {
     chars: Vec<char>,
     /// char index → byte offset. Built lazily on first `slice` (only the
     /// layer-producing path needs it); the boundaries-only path never touches
-    /// it, so we skip the whole `Vec<usize>` allocation for `split_sentences`.
-    char_to_byte: OnceCell<Vec<usize>>,
+    /// it, so we skip the whole allocation for `split_sentences`. Offsets are
+    /// stored as `u32` (texts beyond 4 GiB would overflow; asserted in debug).
+    char_to_byte: OnceCell<Vec<u32>>,
 }
 
 impl<'a> TextView<'a> {
@@ -338,7 +341,8 @@ impl<'a> TextView<'a> {
             let mut v = Vec::with_capacity(self.chars.len() + 1);
             let mut byte = 0usize;
             for ch in &self.chars {
-                v.push(byte);
+                debug_assert!(byte <= u32::MAX as usize);
+                v.push(byte as u32);
                 byte += ch.len_utf8();
             }
             v
@@ -346,7 +350,7 @@ impl<'a> TextView<'a> {
         if index >= map.len() {
             self.text.len()
         } else {
-            map[index]
+            map[index] as usize
         }
     }
 
@@ -457,8 +461,11 @@ const _: () = assert!(EMOJI_LOW_END == EMOJI_HIGH_START);
 /// so the pipeline can merge them in the canonical rule order.
 /// Rule kind for the fused scanner — routes a hit to the right sink and carries
 /// the per-rule annotation strings.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 enum Kind {
+    /// The end-of-text sentinel (layer-0 "first" record).
+    Sentinel,
     Face,
     Emotion,
     Emoji,
@@ -471,6 +478,7 @@ enum Kind {
 impl Kind {
     fn rule_name(self) -> &'static str {
         match self {
+            Kind::Sentinel => "first",
             Kind::Face => "FaceMarkDetector",
             Kind::Emotion => "EmotionExpressionAnnotator",
             Kind::Emoji => "EmojiAnnotator",
@@ -479,10 +487,12 @@ impl Kind {
         }
     }
 
-    fn split_type(self) -> &'static str {
+    fn split_type(self) -> Option<&'static str> {
         match self {
-            Kind::Face => "facemark",
-            other => other.rule_name(),
+            Kind::Sentinel => None,
+            Kind::Face => Some("facemark"),
+            Kind::Linebreak => Some("linebreak"),
+            other => Some(other.rule_name()),
         }
     }
 }
@@ -514,10 +524,9 @@ impl<'v, 'a> Emit for SpanCollector<'v, 'a> {
             return;
         }
         let record = SpanRecord {
-            rule_name: kind.rule_name(),
-            start,
-            end,
-            split_type: Some(kind.split_type()),
+            kind,
+            start: start as u32,
+            end: end as u32,
             split_value: Some(self.view.slice(start, end)),
         };
         match kind {
@@ -525,7 +534,7 @@ impl<'v, 'a> Emit for SpanCollector<'v, 'a> {
             Kind::Emotion => self.emotion.push(record),
             Kind::Emoji => self.emoji.push(record),
             Kind::Basic => self.basic.push(record),
-            Kind::Linebreak => unreachable!(),
+            Kind::Linebreak | Kind::Sentinel => unreachable!(),
         }
     }
 }
@@ -810,7 +819,7 @@ fn apply_indirect_quote<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) 
     // sort+dedup the redundancy away. Build the unique set directly.
     let mut spans: Vec<SpanRecord<'_>> = Vec::with_capacity(state.final_spans().len());
     for span in state.final_spans() {
-        if is_exception_particle(view, span.end) {
+        if is_exception_particle(view, span.end as usize) {
             continue;
         }
         spans.push(span.clone());
@@ -887,7 +896,7 @@ fn unify_span_annotations(spans: Vec<SpanRecord<'_>>) -> Vec<SpanRecord<'_>> {
     spans.dedup_by(|later, earlier| {
         later.start == earlier.start
             && later.end == earlier.end
-            && later.rule_name == earlier.rule_name
+            && later.kind == earlier.kind
             && later.split_value == earlier.split_value
     });
     spans
@@ -896,7 +905,9 @@ fn unify_span_annotations(spans: Vec<SpanRecord<'_>>) -> Vec<SpanRecord<'_>> {
 fn apply_dot_exception<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) {
     let mut filtered: Vec<SpanRecord<'_>> = Vec::with_capacity(state.final_spans().len());
     for span in state.final_spans().iter() {
-        if is_exception_numeric(view, span.start) || is_exception_mailaddress(view, span.start) {
+        if is_exception_numeric(view, span.start as usize)
+            || is_exception_mailaddress(view, span.start as usize)
+        {
             continue;
         }
         filtered.push(span.clone());
@@ -985,7 +996,12 @@ fn is_mail_char(ch: char) -> bool {
 fn apply_number_exception<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) {
     let mut filtered: Vec<SpanRecord<'_>> = Vec::with_capacity(state.final_spans().len());
     for span in state.final_spans().iter() {
-        if is_exception_no_parts(view, span.start, span.end, is_dot_value(span.split_value)) {
+        if is_exception_no_parts(
+            view,
+            span.start as usize,
+            span.end as usize,
+            is_dot_value(span.split_value),
+        ) {
             continue;
         }
         filtered.push(span.clone());
@@ -1039,12 +1055,11 @@ fn apply_linebreak_force<'a>(
 
     let mut result: Vec<SpanRecord<'_>> = Vec::with_capacity(state.final_spans().len() + map.len());
     for span in state.final_spans().iter() {
-        if let Some((lb_start, lb_end)) = map.remove(&span.end) {
+        if let Some((lb_start, lb_end)) = map.remove(&(span.end as usize)) {
             result.push(SpanRecord {
-                rule_name: "LinebreakForceAnnotator",
-                start: lb_start,
-                end: lb_end,
-                split_type: Some("linebreak"),
+                kind: Kind::Linebreak,
+                start: lb_start as u32,
+                end: lb_end as u32,
                 split_value: Some(view.slice(lb_start, lb_end)),
             });
         } else {
@@ -1054,10 +1069,9 @@ fn apply_linebreak_force<'a>(
 
     for (_, (start, end)) in map.into_iter() {
         result.push(SpanRecord {
-            rule_name: "LinebreakForceAnnotator",
-            start,
-            end,
-            split_type: Some("linebreak"),
+            kind: Kind::Linebreak,
+            start: start as u32,
+            end: end as u32,
             split_value: Some(view.slice(start, end)),
         });
     }
@@ -1066,15 +1080,15 @@ fn apply_linebreak_force<'a>(
 }
 
 /// Compact span for the boundaries-only fast path used by [`split_sentences`].
-/// Only the fields the downstream rules actually read are kept: the offsets
-/// each exception checks, and a flag for whether the matched text is exactly
-/// One boundary candidate. Kept to exactly two `usize`s (16 bytes) so the
-/// `active` Vec stays cache-friendly; the `"."`-flag NumberException checks is
-/// derived on the fly from the offsets instead of being stored.
+/// Only the offsets the downstream rules actually read are kept (the
+/// `"."`-flag NumberException checks is derived on the fly instead of being
+/// stored). Two 32-bit offsets — 8 bytes total — keep the `active` Vec
+/// cache-friendly; 2^32 chars (~12 GiB of Japanese text) is far beyond any
+/// realistic input.
 #[derive(Clone, Copy, Debug)]
 struct Bound {
-    start: usize,
-    end: usize,
+    start: u32,
+    end: u32,
 }
 
 /// Boundaries-only sink: pushes each fused-scanner hit straight onto the
@@ -1099,7 +1113,10 @@ impl Emit for BoundMerger<'_> {
             self.linebreaks.push((start, end));
             return;
         }
-        self.active.push(Bound { start, end });
+        self.active.push(Bound {
+            start: start as u32,
+            end: end as u32,
+        });
     }
 }
 
@@ -1117,8 +1134,8 @@ pub(crate) fn segment_bounds_only(text: &str) -> Vec<usize> {
     let view = TextView::new(text);
     let char_len = view.char_len();
     let sentinel = Bound {
-        start: if char_len == 0 { 0 } else { char_len - 1 },
-        end: char_len,
+        start: (if char_len == 0 { 0 } else { char_len - 1 }) as u32,
+        end: char_len as u32,
     };
 
     let mut active: Vec<Bound> = Vec::new();
@@ -1139,20 +1156,22 @@ pub(crate) fn segment_bounds_only(text: &str) -> Vec<usize> {
     // One pass over the candidates (instead of three `retain`s): particle, dot
     // and number exceptions are all per-span and independent.
     active.retain(|c| {
-        if is_exception_particle(&view, c.end) {
+        let start = c.start as usize;
+        let end = c.end as usize;
+        if is_exception_particle(&view, end) {
             return false;
         }
-        if is_exception_numeric(&view, c.start) || is_exception_mailaddress(&view, c.start) {
+        if is_exception_numeric(&view, start) || is_exception_mailaddress(&view, start) {
             return false;
         }
         // A span whose whole matched text is "." / "．" iff it spans exactly
         // that single character — equivalent to `split_value == "."`/`"．"`.
-        let is_dot = c.end == c.start + 1 && matches!(view.chars[c.start], '.' | '．');
-        !is_exception_no_parts(&view, c.start, c.end, is_dot)
+        let is_dot = end == start + 1 && matches!(view.chars[start], '.' | '．');
+        !is_exception_no_parts(&view, start, end, is_dot)
     });
     active = apply_linebreak_force_bounds(active, &linebreaks);
 
-    let mut ends: Vec<usize> = active.iter().map(|c| c.end).collect();
+    let mut ends: Vec<usize> = active.iter().map(|c| c.end as usize).collect();
     ends.sort_unstable();
     ends.dedup();
     ends
@@ -1169,18 +1188,21 @@ fn apply_linebreak_force_bounds(
 
     let mut result: Vec<Bound> = Vec::with_capacity(active.len() + map.len());
     for c in active.drain(..) {
-        if let Some((lb_start, lb_end)) = map.remove(&c.end) {
+        if let Some((lb_start, lb_end)) = map.remove(&(c.end as usize)) {
             // Linebreak spans' matched text is never "." / "．".
             result.push(Bound {
-                start: lb_start,
-                end: lb_end,
+                start: lb_start as u32,
+                end: lb_end as u32,
             });
         } else {
             result.push(c);
         }
     }
     for (_, (start, end)) in map.into_iter() {
-        result.push(Bound { start, end });
+        result.push(Bound {
+            start: start as u32,
+            end: end as u32,
+        });
     }
     result
 }
@@ -1204,7 +1226,7 @@ fn filter_previous_rule_same_span<'a>(
 ) -> Vec<SpanRecord<'a>> {
     let mut filtered: Vec<SpanRecord<'_>> = Vec::with_capacity(current.len() + previous.len());
     for span in current {
-        if (span.start, span.end) == sentinel_key {
+        if (span.start as usize, span.end as usize) == sentinel_key {
             continue;
         }
         filtered.push(span);
@@ -1253,10 +1275,10 @@ pub struct Segmentation<'a> {
 impl<'a> From<SpanRecord<'a>> for Span<'a> {
     fn from(record: SpanRecord<'a>) -> Self {
         Span {
-            rule_name: record.rule_name,
-            start: record.start,
-            end: record.end,
-            split_type: record.split_type,
+            rule_name: record.kind.rule_name(),
+            start: record.start as usize,
+            end: record.end as usize,
+            split_type: record.kind.split_type(),
             split_value: record.split_value,
         }
     }
@@ -1375,7 +1397,7 @@ mod tests {
             .iter()
             .find(|span| span.start == 4 && span.end == 6)
             .expect("expected basic rule span");
-        assert!(is_exception_particle(&view, target.end));
+        assert!(is_exception_particle(&view, target.end as usize));
     }
 
     #[test]
@@ -1403,20 +1425,26 @@ mod tests {
     }
 
     #[test]
+    fn compact_record_sizes() {
+        // The memory-side compactness invariants: SpanRecord halved from 64B
+        // (two fat &'static str fields) to 32B, and Bound from 16B to 8B.
+        assert_eq!(size_of::<SpanRecord<'static>>(), 32);
+        assert_eq!(size_of::<Bound>(), 8);
+    }
+
+    #[test]
     fn unify_keeps_first_of_duplicate_spans() {
         let spans = vec![
             SpanRecord {
-                rule_name: "BasicRule",
+                kind: Kind::Basic,
                 start: 0,
                 end: 3,
-                split_type: Some("BasicRule"),
                 split_value: Some("。"),
             },
             SpanRecord {
-                rule_name: "BasicRule",
+                kind: Kind::Basic,
                 start: 0,
                 end: 3,
-                split_type: Some("BasicRule"),
                 split_value: Some("。"),
             },
         ];
@@ -1630,10 +1658,9 @@ mod tests {
             }
 
             spans.push(SpanRecord {
-                rule_name: "FaceMarkDetector",
-                start,
-                end,
-                split_type: Some("facemark"),
+                kind: Kind::Face,
+                start: start as u32,
+                end: end as u32,
                 split_value: Some(view.slice(start, end)),
             });
             idx = end;
@@ -1663,10 +1690,9 @@ mod tests {
                     if closing == ')' || closing == '）' {
                         let end = end_word + 1;
                         spans.push(SpanRecord {
-                            rule_name: "EmotionExpressionAnnotator",
-                            start: idx,
-                            end,
-                            split_type: Some("EmotionExpressionAnnotator"),
+                            kind: Kind::Emotion,
+                            start: idx as u32,
+                            end: end as u32,
                             split_value: Some(view.slice(idx, end)),
                         });
                         break;
@@ -1695,10 +1721,9 @@ mod tests {
                 }
             }
             spans.push(SpanRecord {
-                rule_name: "EmotionExpressionAnnotator",
-                start,
-                end,
-                split_type: Some("EmotionExpressionAnnotator"),
+                kind: Kind::Emotion,
+                start: start as u32,
+                end: end as u32,
                 split_value: Some(view.slice(start, end)),
             });
         }
@@ -1724,10 +1749,9 @@ mod tests {
             }
             let end = i;
             spans.push(SpanRecord {
-                rule_name: "BasicRule",
-                start,
-                end,
-                split_type: Some("BasicRule"),
+                kind: Kind::Basic,
+                start: start as u32,
+                end: end as u32,
                 split_value: Some(view.slice(start, end)),
             });
         }
@@ -1740,10 +1764,9 @@ mod tests {
             .into_iter()
             .filter(|span| span.end > span.start && span.any_target)
             .map(|span| SpanRecord {
-                rule_name: "EmojiAnnotator",
-                start: span.start,
-                end: span.end,
-                split_type: Some("EmojiAnnotator"),
+                kind: Kind::Emoji,
+                start: span.start as u32,
+                end: span.end as u32,
                 split_value: Some(view.slice(span.start, span.end)),
             })
             .collect()
