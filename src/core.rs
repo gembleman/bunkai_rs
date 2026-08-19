@@ -1097,23 +1097,15 @@ struct Bound {
 ///
 /// It runs the exact same rules as [`segment_impl`], but scans the UTF-8 bytes
 /// directly (decoding inline, once) and emits compact [`Bound`]s straight out
-/// of the scanner; no per-layer records, sorting, or materialisation. Every
-/// offset is on a char boundary (spans are only emitted at char starts), so the
-/// caller can slice `text` at each one directly. First-wins-per-(start,end)
-/// semantics (including the end-of-text sentinel) make the surviving set
-/// exactly the final layer's boundaries re-expressed in bytes — verified by the
-/// golden/differential suites and the bounds-vs-pipeline property test.
+/// of the scanner; no per-layer records or materialisation. Every offset is on
+/// a char boundary (spans are only emitted at char starts), so the caller can
+/// slice `text` at each one directly. First-wins-per-(start,end) semantics
+/// make the surviving set exactly the final layer's boundaries re-expressed in
+/// bytes — verified by the golden/differential suites and the
+/// bounds-vs-pipeline property test.
 pub(crate) fn sentence_byte_boundaries(text: &str) -> Vec<usize> {
     let len = text.len();
     let mut active: Vec<Bound> = Vec::new();
-    // The sentinel guarantees the end-of-text boundary; pushed first but, with
-    // no dedup set, a one-char rule span at the very last position may also
-    // land here — the final {sort,dedup} of `ends` collapses them.
-    active.push(Bound {
-        start: len as u32,
-        end: len as u32,
-    });
-
     let mut linebreaks: Vec<(usize, usize)> = Vec::new();
     scan_bounds_bytes(text, &mut active, &mut linebreaks);
 
@@ -1136,9 +1128,33 @@ pub(crate) fn sentence_byte_boundaries(text: &str) -> Vec<usize> {
         let is_dot = byte_bound_is_dot(text, start, end);
         !is_exception_no_parts_bytes(text, start, end, is_dot)
     });
-    active = apply_linebreak_force_bounds(active, &linebreaks);
 
+    // The end-of-text sentinel is appended below instead of riding through the
+    // pipeline as a member: it can never be rejected by an exception (its end
+    // is the text length, its start reads nothing for the dot rules) and never
+    // anchors a linebreak (no linebreak starts at text end), so carrying it in
+    // `active` only added a dead element to every pass.
+    //
+    // No newline ⇒ no LinebreakForce replacement to fold in (that path used to
+    // build a HashMap and copy `active` even when there was nothing to
+    // replace). Note the ends are *not* guaranteed sorted or unique even here:
+    // spans from different rules can overlap — e.g. a kaomoji whose trailing
+    // suffix extension swallows a following `!?…` run — so the sort+dedup below
+    // is still required on both paths.
+    if linebreaks.is_empty() {
+        let mut ends: Vec<usize> = Vec::with_capacity(active.len() + 1);
+        ends.extend(active.iter().map(|c| c.end as usize));
+        ends.push(len);
+        ends.sort_unstable();
+        ends.dedup();
+        return ends;
+    }
+
+    let active = apply_linebreak_force_bounds(active, &linebreaks);
+    // The merge may place a duplicate end next to a leftover linebreak, so the
+    // (cheap, rare) sort+dedup is still required on this path.
     let mut ends: Vec<usize> = active.iter().map(|c| c.end as usize).collect();
+    ends.push(len);
     ends.sort_unstable();
     ends.dedup();
     ends
@@ -1549,31 +1565,49 @@ fn is_exception_no_parts_bytes(text: &str, start: usize, end: usize, is_dot: boo
 }
 
 fn apply_linebreak_force_bounds(
-    mut active: Vec<Bound>,
+    active: Vec<Bound>,
     linebreaks: &[(usize, usize)],
 ) -> Vec<Bound> {
-    let mut map: HashMap<usize, (usize, usize)> = HashMap::new();
-    for &(start, end) in linebreaks {
-        map.insert(start, (start, end));
-    }
-
-    let mut result: Vec<Bound> = Vec::with_capacity(active.len() + map.len());
-    for c in active.drain(..) {
-        if let Some((lb_start, lb_end)) = map.remove(&(c.end as usize)) {
-            // Linebreak spans' matched text is never "." / "．".
-            result.push(Bound {
-                start: lb_start as u32,
-                end: lb_end as u32,
-            });
-        } else {
+    // A HashMap is overkill here: `linebreaks` already arrives from the scanner
+    // sorted by ascending start with unique starts, so each bound's end is
+    // looked up against the linebreak starts with a binary search — no hashing
+    // and, apart from one tiny `consumed` byte array of length L, no heap
+    // structure. This path runs only when the text actually contains a newline.
+    //
+    // The `consumed` flags preserve first-wins semantics: spans from different
+    // rules can *overlap* (a kaomoji's trailing suffix swallows a following
+    // `!?…` run) and two bounds may therefore share the same end, but each
+    // linebreak must anchor (replace) at most one of them. Exactly which bound
+    // is replaced doesn't change the resulting boundary *set* (the survivor
+    // keeps the shared end either way), so a consumed marker per linebreak —
+    // instead of per candidate — is exact.
+    let mut consumed = vec![false; linebreaks.len()];
+    let mut result: Vec<Bound> = Vec::with_capacity(active.len() + linebreaks.len());
+    for c in active {
+        let end = c.end as usize;
+        let replaced = match linebreaks.binary_search_by_key(&end, |&(s, _)| s) {
+            Ok(i) if !consumed[i] => {
+                consumed[i] = true;
+                // Linebreak spans' matched text is never "." / "．".
+                result.push(Bound {
+                    start: linebreaks[i].0 as u32,
+                    end: linebreaks[i].1 as u32,
+                });
+                true
+            }
+            _ => false,
+        };
+        if !replaced {
             result.push(c);
         }
     }
-    for (_, (start, end)) in map.into_iter() {
-        result.push(Bound {
-            start: start as u32,
-            end: end as u32,
-        });
+    for (i, &(s, e)) in linebreaks.iter().enumerate() {
+        if !consumed[i] {
+            result.push(Bound {
+                start: s as u32,
+                end: e as u32,
+            });
+        }
     }
     result
 }
