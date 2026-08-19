@@ -92,6 +92,18 @@ later rules refine earlier ones. The pipeline order is:
 A sentinel `first` layer always ends the text, so `final_boundaries` always
 contains the length of the input.
 
+## Formal specification & verification
+
+The algorithm is specified mathematically in [`docs/spec.md`](docs/spec.md):
+character-class predicates, every rule as a set comprehension over maximal
+runs, the exception filters, and the boundary set `B(s)` — with proofs of
+well-formedness, the first-wins priority lemma, the linebreak-replacement
+formula and lossless segmentation. `src/spec_model.rs` (test-only) is an
+independent, deliberately naive transcription of *those formulas* — no shared
+code with `core.rs` — and the test suite verifies model ≡ pipeline ≡ fast path
+≡ Python-derived reference over 15,423 strings (11,550 generated + 3,388
+golden + 485 differential), plus the theorem checks.
+
 ## Trade-offs vs. the original Python
 
 bunkai uses [Janome](https://github.com/mecab/ja/Janome) to morphologically
