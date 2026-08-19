@@ -714,6 +714,9 @@ fn apply_indirect_quote<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) 
         .iter()
         .filter_map(|&t| state.get_layer(t).map(|l| l.len()))
         .sum();
+    // The target layers are cumulative (each forward rule re-includes all
+    // earlier layers), so the same span appears many times across them; the
+    // sort+dedup in `unify_span_annotations` collapses those to a unique set.
     let mut collected: Vec<SpanRecord<'_>> = Vec::with_capacity(total_target);
     for &target in INDIRECT_RULE_TARGETS {
         if let Some(layer) = state.get_layer(target) {
@@ -989,57 +992,62 @@ fn filter_previous_rule_same_span<'a>(
 
 /// A single annotated span produced by one of the pipeline rules.
 ///
+/// All string fields are borrowed and cost no per-span allocation:
+/// `rule_name`/`split_type` are `'static` (rule names are fixed refs), and
+/// `split_value`, when present, is a slice into the input text.
+///
 /// Offsets are measured in Unicode scalar values (`char` indices) over the
 /// input string, not byte offsets.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Span {
-    pub rule_name: String,
+pub struct Span<'a> {
+    pub rule_name: &'static str,
     pub start: usize,
     pub end: usize,
-    pub split_type: Option<String>,
-    pub split_value: Option<String>,
+    pub split_type: Option<&'static str>,
+    pub split_value: Option<&'a str>,
 }
 
 /// One stage in the segmentation pipeline, named after the rule that produced it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Layer {
-    pub name: String,
-    pub spans: Vec<Span>,
+pub struct Layer<'a> {
+    pub name: &'static str,
+    pub spans: Vec<Span<'a>>,
 }
 
 /// The full result of segmenting a piece of text.
 ///
 /// `layers` records every intermediate pipeline stage; `final_boundaries`
 /// gives the unique character offsets at which the final layer would cut the
-/// input into sentences.
+/// input into sentences. This value borrows from the input text, which must
+/// therefore outlive it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Segmentation {
-    pub layers: Vec<Layer>,
+pub struct Segmentation<'a> {
+    pub layers: Vec<Layer<'a>>,
     pub final_boundaries: Vec<usize>,
 }
 
-impl<'a> From<SpanRecord<'a>> for Span {
+impl<'a> From<SpanRecord<'a>> for Span<'a> {
     fn from(record: SpanRecord<'a>) -> Self {
         Span {
-            rule_name: record.rule_name.to_string(),
+            rule_name: record.rule_name,
             start: record.start,
             end: record.end,
-            split_type: record.split_type.map(|s| s.to_string()),
-            split_value: record.split_value.map(|s| s.to_string()),
+            split_type: record.split_type,
+            split_value: record.split_value,
         }
     }
 }
 
-impl<'a> From<LayerOutput<'a>> for Layer {
+impl<'a> From<LayerOutput<'a>> for Layer<'a> {
     fn from(layer: LayerOutput<'a>) -> Self {
         Layer {
-            name: layer.name.to_string(),
+            name: layer.name,
             spans: layer.spans.into_iter().map(Span::from).collect(),
         }
     }
 }
 
-impl<'a> From<PipelineOutput<'a>> for Segmentation {
+impl<'a> From<PipelineOutput<'a>> for Segmentation<'a> {
     fn from(output: PipelineOutput<'a>) -> Self {
         Segmentation {
             layers: output.layers.into_iter().map(Layer::from).collect(),
@@ -1051,10 +1059,21 @@ impl<'a> From<PipelineOutput<'a>> for Segmentation {
 /// Segment Japanese text into sentence-like units.
 ///
 /// Returns the full [`Segmentation`] result, including every intermediate
-/// pipeline layer and the final list of character-offset boundaries.
-pub fn segment(text: &str) -> Segmentation {
+/// pipeline layer and the final list of character-offset boundaries. The
+/// returned value borrows from `text` (each `split_value` is a slice of it),
+/// so `text` must outlive the result — no per-span heap allocation occurs.
+///
+/// ```
+/// use bunkai_rs::segment;
+///
+/// let text = "これは一文目。これは二文目。";
+/// let seg = segment(text);
+/// assert_eq!(seg.final_boundaries, vec![7, 14]);
+/// assert_eq!(seg.layers.last().unwrap().name, "LinebreakForceAnnotator");
+/// ```
+pub fn segment(text: &str) -> Segmentation<'_> {
     prof::begin("materialize");
-    let seg: Segmentation = segment_impl(text).into();
+    let seg: Segmentation<'_> = segment_impl(text).into();
     prof::end();
     prof::on_segment_done();
     seg
@@ -1085,24 +1104,25 @@ pub fn split_sentences(text: &str) -> Vec<&str> {
 fn split_sentences_impl(text: &str) -> Vec<&str> {
     let boundaries = segment_impl(text).final_boundaries;
 
-    // final_boundaries holds char indices; map them back to byte offsets.
-    let char_to_byte: Vec<usize> = text
-        .char_indices()
-        .map(|(byte, _)| byte)
-        .chain(std::iter::once(text.len()))
-        .collect();
-
-    let mut out = Vec::with_capacity(boundaries.len());
-    let mut start = 0usize;
-    for &end in &boundaries {
-        if end >= char_to_byte.len() || end < start {
-            continue;
+    // `final_boundaries` holds char indices, but we need byte offsets to slice.
+    // Walk char_indices once, cutting at each boundary as we go — this avoids
+    // materialising a full char-index→byte-offset Vec (one fewer whole-text pass).
+    let mut out = Vec::with_capacity(boundaries.len() + 1);
+    let mut start_byte = 0usize;
+    let mut bi = 0usize; // next boundary to cut at
+    for (char_idx, (byte, _)) in text.char_indices().enumerate() {
+        if bi < boundaries.len() && char_idx == boundaries[bi] {
+            // `byte` is this char's start and also the byte offset of the
+            // just-completed sentence's end boundary.
+            out.push(&text[start_byte..byte]);
+            start_byte = byte;
+            bi += 1;
         }
-        out.push(&text[char_to_byte[start]..char_to_byte[end]]);
-        start = end;
     }
-    if start < char_to_byte.len() && char_to_byte[start] < text.len() {
-        out.push(&text[char_to_byte[start]..]);
+    // Any boundary equal to the char length (end of text) leaves the final
+    // sentence to be emitted here. `start_byte` is always a char boundary.
+    if start_byte < text.len() {
+        out.push(&text[start_byte..]);
     }
     out
 }

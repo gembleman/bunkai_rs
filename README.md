@@ -119,20 +119,26 @@ $ cargo bench --bench segment
 
 Uses [criterion](https://github.com/bheisler/criterion.rs) with the release
 profile (LTO, `codegen-units = 1`). Results for `bunkai_rs` v0.1.0, on the
-built-in Japanese corpus (Xeon-class host, single thread):
+built-in Japanese corpus (single thread):
 
 | text size | `segment` | `split_sentences` |
 | --- | ---: | ---: |
-| 61 B (one sentence) | ~1.7 µs | ~1.3 µs |
-| 7 KB (article) | ~148 µs | ~67 µs |
-| 56 KB (long doc) | ~1.65 ms | ~520 µs |
+| 61 B (one sentence) | ~1.18 µs | ~1.21 µs |
+| 7 KB (article) | ~58 µs | ~62 µs |
+| 56 KB (long doc) | ~447 µs | ~473 µs |
 
-Relative to the original regex/HashMap port, the optimisation pass reduces
-`split_sentences` by ~80% and `segment` by ~54% on the 7 KB corpus — mostly by
-borrowing `split_value` from the input instead of owning a `String` per span,
-hand-writing the two regular expressions and the emoji-table lookup (which also
-drops the `regex` and `once_cell` dependencies), and giving `split_sentences` a
-fast path that never materialises the per-layer `Span` records.
+*(Client-facing spans borrow from the input text — all string fields are
+`&'static str` / `&str` slices — so `segment` allocates no per-span strings and
+is typically on par with `split_sentences`.)*
+
+Relative to the original regex/HashMap port, the optimisation pass makes
+`segment` ~2.5× faster and `split_sentences` ~1.1× faster on the 7 KB corpus. It
+removes the per-span `String` allocations (the public `Span`/`Layer`/
+`Segmentation` now borrow their string fields from the input instead of owning
+them), hand-writes the two regular expressions and the emoji-table lookup
+(which also drops the `regex` and `once_cell` dependencies and skips the whole
+CJK/kanji range in the emoji scan), and gives `split_sentences` a fast path that
+ever materialises the per-layer `Span` records.
 
 ## License
 

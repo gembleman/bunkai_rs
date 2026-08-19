@@ -14,7 +14,7 @@ fn sentences(text: &str) -> Vec<String> {
     boundaries_to_sentences(text, &seg)
 }
 
-fn boundaries_to_sentences(text: &str, seg: &Segmentation) -> Vec<String> {
+fn boundaries_to_sentences(text: &str, seg: &Segmentation<'_>) -> Vec<String> {
     // `final_boundaries` holds char (Unicode scalar) offsets; convert them to
     // byte offsets so we can slice the original `&str`.
     let char_to_byte: Vec<usize> = text
@@ -50,7 +50,7 @@ fn final_rule_names(text: &str) -> Vec<String> {
             let mut names: Vec<String> = layer
                 .spans
                 .iter()
-                .map(|s| s.rule_name.clone())
+                .map(|s| s.rule_name.to_owned())
                 .filter(|n| n != "first")
                 .collect();
             names.sort();
