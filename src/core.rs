@@ -17,6 +17,7 @@
 ///   `HashMap` keyed by a formatted string.
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasherDefault;
 
 use crate::emoji_data;
 
@@ -1063,7 +1064,7 @@ struct Bound {
 /// from the offsets the same way `split_value` used to be.
 struct BoundMerger<'a> {
     active: &'a mut Vec<Bound>,
-    seen: &'a mut HashSet<(usize, usize)>,
+    seen: &'a mut FxSet<(usize, usize)>,
     chars: &'a [char],
     /// Newline whitespace runs, in scan order (linebreak spans).
     linebreaks: Vec<(usize, usize)>,
@@ -1104,7 +1105,7 @@ pub(crate) fn segment_bounds_only(text: &str) -> Vec<usize> {
     };
 
     let mut active: Vec<Bound> = Vec::new();
-    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    let mut seen: FxSet<(usize, usize)> = FxSet::default();
     seen.insert((sentinel.start, sentinel.end));
     active.push(sentinel);
 
@@ -1168,9 +1169,9 @@ fn filter_previous_rule_same_span<'a>(
     current: Vec<SpanRecord<'a>>,
     previous: &[SpanRecord<'a>],
 ) -> Vec<SpanRecord<'a>> {
-    let prev_keys: HashSet<(usize, usize)> =
+    let prev_keys: FxSet<(usize, usize)> =
         previous.iter().map(|span| (span.start, span.end)).collect();
-    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    let mut seen: FxSet<(usize, usize)> = FxSet::default();
 
     let mut filtered: Vec<SpanRecord<'_>> = Vec::with_capacity(current.len() + previous.len());
     for span in current {
@@ -1186,6 +1187,48 @@ fn filter_previous_rule_same_span<'a>(
     filtered.extend(previous.iter().cloned());
     filtered
 }
+
+/// A fast, deterministic FxHash-style integer hasher. Used only for the hot
+/// membership `HashSet`s keyed by `(start, end)` offsets — which are never
+/// iterated — so the choice of hasher cannot affect any public output. The
+/// linebreak `HashMap`s, whose iteration order feeds the layer output, keep the
+/// default SipHash.
+#[derive(Clone, Default)]
+struct FxHasher(usize);
+
+const FX_K: usize = 0x517cc1b727220a95;
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0 as u64
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u8(b);
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.0 = (self.0.rotate_left(5) ^ i as usize).wrapping_mul(FX_K);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i as usize).wrapping_mul(FX_K);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(FX_K);
+    }
+}
+
+/// A `HashSet` with the fast hasher above.
+type FxSet<K> = HashSet<K, BuildHasherDefault<FxHasher>>;
 
 /// A single annotated span produced by one of the pipeline rules.
 ///
