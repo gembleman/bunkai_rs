@@ -1302,6 +1302,134 @@ fn prev_char_start(bytes: &[u8], b: usize) -> usize {
     p
 }
 
+/// Sentinel for `prev` after a skipped kana/kanji run. Any char outside
+/// the trigger/whitespace/emoji classes works: every per-position start-check
+/// only tests membership in those classes, so a CJK char and this sentinel are
+/// indistinguishable to each of them (guarded by the differential suite).
+const KANA_SENTINEL: char = 'あ';
+
+/// Byte-pattern predicate: is the UTF-8 scalar starting at `b` a "pure
+/// kana/kanji" codepoint that can NEVER be a scanner trigger (basic punct /
+/// emotion symbol), whitespace, or emoji — so it can be bulk-skipped without
+/// decoding?
+///
+/// Derivation (UTF-8 byte patterns; see `docs/optimization-hardware.md` for the
+/// full write-up). A char is skippable iff its bytes are a lead `0xE4..=0xE9`
+/// (⇒ U+4000..=0x9FFF, the CJK Unified Ideographs) or a lead `0xE3` whose 2nd
+/// byte is `0x81..=0x83` (⇒ U+3040..=0x30FF, hiragana + katakana).
+///
+/// The `0xE4..=0xE9` range sits inside the emoji-free hole `0x3300..0x1F000`,
+/// every White_Space codepoint is ≤ U+3000, and the only basic punctuators are
+/// 。=E3 80 82, ！？．=EF BC xx and ASCII `.!?`; the emotion symbols are
+/// U+2026/2605/2606/266A. `EMOJI_DATA` has zero entries in U+4000..=0x9FFF, and
+/// the kana range is short-circuited by `emoji_lookup` — so neither range holds
+/// a trigger, whitespace or emoji.
+///
+/// Everything else is excluded because it overlaps a trigger/ws/emoji: `0xE3
+/// 0x80` (U+3000..=0x303F) holds 　U+3000 (ws), 。U+3002 (basic punct) and
+/// 〰U+3030; `0xE3 0x8A` (U+3290..) holds the emoji ⚗ U+3297 and ⚙ U+3299;
+/// `0xEF` (fullwidth forms) holds ！U+FF01, ？U+FF1F, ．U+FF0E; `0xE0..=0xE2`
+/// holds ws (U+2000s, U+2028/2029/202F/205F) and emotion symbols (…★☆♪);
+/// `0xF0..=0xF4` is plane-1 emoji (e.g. 😀 = F0 9F 98 80); and `0x00..=0x7F` is
+/// ASCII `.!?` and whitespace. The skip set is therefore provably disjoint
+/// from every trigger/ws/emoji codepoint.
+#[inline]
+fn cjk_skip_ok(bytes: &[u8], b: usize) -> bool {
+    let lead = bytes[b];
+    if (0xE4..=0xE9).contains(&lead) {
+        return true;
+    }
+    if lead == 0xE3 {
+        // The 2nd byte exists for any lead starting a char inside a valid
+        // `&str`; the `get` guard is defensive for a trailing partial char.
+        if let Some(&second) = bytes.get(b + 1) {
+            return (0x81..=0x83).contains(&second);
+        }
+    }
+    false
+}
+
+/// Read 8 little-endian bytes from `bytes[b..b+8]` without assuming
+/// alignment. Compiles to a single unaligned load on x86-64; no `unsafe`.
+#[inline]
+fn read_u64_unaligned(bytes: &[u8], b: usize) -> u64 {
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[b..b + 8]);
+    u64::from_le_bytes(buf)
+}
+
+/// Advance `b` past a maximal run of pure kana/kanji chars (see `cjk_skip_ok`).
+///
+/// SWAR-accelerated. In valid UTF-8 a 3-byte lead is always followed by two
+/// continuation bytes, so a run of skippable chars is fully described by its
+/// *lead* bytes at offsets 0, 3, 6 (the in-between continuation bytes are
+/// guaranteed by validity and need no check). We load 8 bytes, then compute in
+/// parallel — via the subtract-borrow range trick — a mask of which bytes are
+/// skippable leads, and advance by 0/3/6 (always a multiple of 3, so the next
+/// window stays lead-aligned). A scalar tail finishes any remaining partial
+/// window. No `unsafe` and no target-feature intrinsics (stable-only crate).
+fn cjk_skip_run(bytes: &[u8], mut b: usize, len: usize) -> usize {
+    const REP_E4: u64 = 0xE4E4E4E4E4E4E4E4;
+    const REP_E9: u64 = 0xE9E9E9E9E9E9E9E9;
+    const REP_E3: u64 = 0xE3E3E3E3E3E3E3E3;
+    const REP_81: u64 = 0x8181818181818181;
+    const REP_83: u64 = 0x8383838383838383;
+    const TOP: u64 = 0x8080_8080_8080_8080;
+    while b + 8 <= len {
+        let w = read_u64_unaligned(bytes, b);
+        // skippable-lead mask: (byte ∈ [0xE4,0xE9]) OR
+        // (byte == 0xE3 AND next byte ∈ [0x81,0x83]).
+        let e4e9 = !(w.wrapping_sub(REP_E4) | REP_E9.wrapping_sub(w)) & TOP;
+        let e3 = !(w ^ REP_E3) & TOP;
+        let next = w >> 8; // byte_{k+1} aligned to position k
+        let next_ok = !(next.wrapping_sub(REP_81) | REP_83.wrapping_sub(next)) & TOP;
+        let lead = e4e9 | (e3 & next_ok);
+        // lead bits at byte offsets 0 / 3 / 6.
+        let s0 = (lead & 0x0000_0000_0000_0080) != 0;
+        let s3 = (lead & 0x0000_0000_8000_0000) != 0;
+        let s6 = (lead & 0x8000_0000_0000_0000) != 0;
+        if !s0 {
+            break;
+        } else if !s3 {
+            b += 3;
+            break;
+        } else if !s6 {
+            b += 6;
+            break;
+        } else {
+            b += 6;
+        }
+    }
+    while b + 3 <= len && cjk_skip_ok(bytes, b) {
+        b += 3;
+    }
+    b
+}
+
+/// Debug-only guard: every char in `[start, end)` is genuinely boring (not a
+/// trigger / whitespace / emoji / face-mark opener). If a future edit ever
+/// widens `cjk_skip_ok` to include a dangerous byte pattern, this catches it
+/// on the very next test run instead of relying on the corpus happening to
+/// exercise the regression. Only ever invoked from a `debug_assert!`, so it is
+/// compiled in release but never executed there.
+fn cjk_run_is_boring(bytes: &[u8], start: usize, end: usize) -> bool {
+    let mut b = start;
+    while b < end {
+        let (c, n) = char_at_byte(bytes, b);
+        let boring = c != '('
+            && c != '（'
+            && !is_basic_punct(c)
+            && !is_ws(c)
+            && !EMOTION_SYMBOLS.contains(&c)
+            && emoji_lookup(c as u32).is_none();
+        if !boring {
+            return false;
+        }
+        b += n;
+    }
+    true
+}
+
 /// Byte-level fused scanner, mirroring [`scan_all_with`] over the char vec body
 /// for body. Walks the UTF-8 bytes once, decoding each codepoint inline, and
 /// pushes *byte*-offset [`Bound`]s directly — no `Vec<char>` build, no char→byte
@@ -1320,6 +1448,24 @@ fn scan_bounds_bytes(text: &str, active: &mut Vec<Bound>, linebreaks: &mut Vec<(
     // in `EMOJI_DATA`, so `is_emoji` is exactly that predicate for every `ch`.
     let mut prev_is_emoji = false;
     while b < len {
+        // Bulk-skip runs of pure kana/kanji bytes — the dominant case for
+        // Japanese prose. These codepoints can never be a trigger, whitespace
+        // or emoji (byte-pattern proof in `cjk_skip_ok`), so we advance past
+        // them without decoding each scalar or dispatching per char. This is a
+        // large saving over the old loop, which decoded and classified every
+        // character individually.
+        let run_end = cjk_skip_run(bytes, b, len);
+        if run_end != b {
+            debug_assert!(cjk_run_is_boring(bytes, b, run_end));
+            // All skipped chars are non-trigger / non-ws / non-emoji, so the
+            // sentinel below reproduces the per-position "prev" start-checks
+            // exactly (a real CJK char would pass the same checks).
+            prev = Some(KANA_SENTINEL);
+            prev_is_emoji = false;
+            b = run_end;
+            continue;
+        }
+
         let (ch, n) = char_at_byte(bytes, b);
         let mut is_emoji = false;
         match ch {
@@ -1964,6 +2110,72 @@ mod tests {
         ];
         let unified = unify_span_annotations(spans);
         assert_eq!(unified.len(), 1);
+    }
+
+    #[test]
+    fn byte_skip_boundary_safety() {
+        // `scan_bounds_bytes` bulk-advances past runs of pure kana/kanji bytes
+        // (see `cjk_skip_run`). The byte ranges it skips are provably disjoint
+        // from every trigger/whitespace/emoji codepoint, but that proof rests
+        // on excluding the *exact* dangerous patterns: 。/　 (E3 80),
+        // ！？． (EF BC), the E3 8A emoji ⚗ U+3297 / ⚙ U+3299, and ASCII
+        // .!?/whitespace. This test pins that invariant by placing each of
+        // those patterns directly against long kana/kanji runs — including the
+        // E3 8A emoji that the existing differential/golden corpus never
+        // touches — so a wrong exclusion would change the boundary set instead
+        // of passing by luck.
+        const KANA: &[&str] = &[
+            "日本語の文章",
+            "かなかな",
+            "漢字かな",
+            "カタカナ文章",
+            "のですます",
+            "あいうえお",
+            "たちつてと",
+            "さしすせそ",
+            "たちつてとなにぬねの",
+        ];
+        const DANGER: &[&str] = &[
+            "。", "　", "〰", "！", "？", "．", "⚗", "⚙", "😀", "\n", " ", ".", "!", "?",
+        ];
+        let mut cases: Vec<String> = Vec::new();
+        for k in KANA {
+            for d in DANGER {
+                cases.push(format!("{k}{d}{k}"));
+                cases.push(format!("{d}{k}"));
+                cases.push(format!("{k}{d}"));
+                cases.push(format!("{k}\n{k}"));
+                cases.push(format!("{k}{d}\n{k}"));
+                cases.push(format!("{k}\n{d}{k}"));
+            }
+            // a long pure CJK run with no danger (exercises the bulk skip itself)
+            cases.push(format!("{k}{k}{k}{k}"));
+        }
+        for a in KANA {
+            for b in KANA {
+                cases.push(format!("{a}{b}"));
+            }
+        }
+        cases.push("⚗漢字⚙かな😀です。".into());
+        cases.push("漢字⚗⚙かな😀です。".into());
+        cases.push("かな⚗漢字⚙かな😀です？".into());
+        for text in &cases {
+            let via_bounds = sentence_byte_boundaries(text);
+            let via_pipeline = segment_impl(text).final_boundaries;
+            let mut via_pipeline_bytes: Vec<usize> = Vec::with_capacity(via_pipeline.len());
+            let mut bi = 0usize;
+            for (char_idx, (byte, _)) in text.char_indices().enumerate() {
+                if bi < via_pipeline.len() && char_idx == via_pipeline[bi] {
+                    via_pipeline_bytes.push(byte);
+                    bi += 1;
+                }
+            }
+            if bi < via_pipeline.len() {
+                debug_assert_eq!(via_pipeline[bi], text.chars().count());
+                via_pipeline_bytes.push(text.len());
+            }
+            assert_eq!(via_bounds, via_pipeline_bytes, "byte-skip diverged on {text:?}");
+        }
     }
 
     #[test]
