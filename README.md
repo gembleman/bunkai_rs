@@ -205,29 +205,30 @@ main contributors.
 
 [fast-bunkai](https://github.com/hotchpotch/fast-bunkai) is the other main
 Rust-based reimplementation of the same bunkai pipeline: a PyO3 Rust core
-wrapped by a Python API. The tables below compare it against `bunkai_rs` on
-**this machine (AMD Ryzen 7 H 255, 16 threads, release profile + LTO +
-`codegen-units=1`)**, using the exact same corpus as the built-in benchmark
-above (61 B single sentence / 7 KB article / 56 KB long doc, all mixed
-Japanese with emoji, kaomoji, decimals, `No.` ordinals, indirect quotes and
-line breaks).
+wrapped by a Python API, on **this machine (AMD Ryzen 7 H 255, release
+profile + LTO + `codegen-units=1`)**.
 
-### Rust core vs. Rust core
+### Rust core vs. Rust core — `split_sentences`, the API real callers use
 
-Both cores were benchmarked in a **single criterion process** with identical
-release settings, so the ratios are directly comparable:
+Almost every caller only needs sentence boundaries, not the full layered
+`Span`/`Layer` history — so the comparison that matters is `bunkai_rs`'s
+boundaries-only fast path, `split_sentences`, against fast-bunkai's *only*
+entry point, `segment()` (fast-bunkai has no dedicated fast path). Measured
+natively — both crates linked as plain `rlib`s in one process, single core
+pinned (`taskset -c 0`), `perf stat -e cycles,instructions -r 5`+, medians
+over 9 samples — on two fresh ~127 KiB corpora:
 
-| text size | `bunkai_rs::segment` | `bunkai_rs::split_sentences` | fast-bunkai core `segment` | speedup vs. fast-bunkai core |
-| --- | ---: | ---: | ---: | ---: |
-| 61 B (one sentence) | 0.38 µs | 0.10 µs | 3.09 µs | ~8× (`segment`) / ~31× (`split_sentences`) |
-| 7 KB (article) | 26.0 µs | 17.7 µs | 322 µs | ~12× / ~18× |
-| 56 KB (long doc) | 213 µs | 142 µs | 2.76 ms | ~13× / ~19× |
+| corpus | `bunkai_rs::split_sentences` | fast-bunkai `segment()` | speedup |
+| --- | ---: | ---: | ---: |
+| CJK-heavy (43,664 chars: kana/kanji + Japanese punctuation only) | 7.55 cyc/char (87 µs/call) | 194.0 cyc/char (2.23 ms/call) | **~25.7×** |
+| Mixed (56,885 chars: Japanese + Latin + decimals + `No.` ordinals + emoji + kaomoji + line breaks) | 57.1 cyc/char (856 µs/call) | 749.6 cyc/char (11.3 ms/call) | **~13.1×** |
 
-Every fast-bunkai core result includes the per-span `split_value` string
-allocations and HashMap/HashSet-based merging; `bunkai_rs::segment` is still
-faster despite returning the same full layer information. On this corpus both
-engines produce **bit-identical boundary lists** (verified on all three
-sizes).
+The CJK-heavy gap is the widest because `bunkai_rs`'s SWAR-accelerated
+kana/kanji run-skip (see [Benchmark](#benchmark) below) makes pure Japanese
+prose nearly free to scan, while fast-bunkai's regex + HashMap/HashSet core
+pays its per-character matching cost regardless of script. Both engines
+produce **identical sentence boundaries** — verified differentially on 40,083
+generated + corpus cases, 0 mismatches.
 
 ### Full stack: Python API vs. native API
 
@@ -236,7 +237,10 @@ fast-bunkai's user-facing Python API (`FastBunkai(text)` → sentences, which
 builds the full segmentation in the native core and converts it to Python
 objects) against `bunkai_rs`'s native `split_sentences`. The original Python
 [`bunkai`](https://github.com/megagonlabs/bunkai) is included for context
-(its Janome tokenizer dominates the runtime):
+(its Janome tokenizer dominates the runtime). This table uses the built-in
+benchmark's corpus (61 B single sentence / 7 KB article / 56 KB long doc, all
+mixed Japanese with emoji, kaomoji, decimals, `No.` ordinals, indirect quotes
+and line breaks) rather than the CJK-heavy/Mixed pair above:
 
 | text size | Python `bunkai` | fast-bunkai (Python API) | `bunkai_rs::split_sentences` | speedup vs. fast-bunkai |
 | --- | ---: | ---: | ---: | ---: |
@@ -253,12 +257,14 @@ call overhead dominate the tiny native runtime.
 
 ### Reproducing
 
-The core-to-core numbers come from a small criterion bench that links both
-crates as rlibs (`bunkai_rs` + `fast_bunkai_native` with
-`default-features = false`) in a single process and runs the identical three
-text sizes; the Python-side numbers come from driving the same strings through
-`FastBunkai` / `Bunkai` in a venv (fast-bunkai's native module built for Linux
-via `maturin develop --release`).
+The `split_sentences`-vs-`segment()` numbers come from a small binary that
+links both crates as plain `rlib`s (`bunkai_rs` + `fast_bunkai_native` with
+`default-features = false`) in a single process, run under `perf stat`
+core-pinned with `taskset -c 0` for cycle-accurate, turbo-noise-resistant
+measurement (a bare wall-clock/criterion run is not trusted alone — see
+`todo.md`'s optimization log for why). The Python-side numbers come from
+driving the same strings through `FastBunkai` / `Bunkai` in a venv
+(fast-bunkai's native module built for Linux via `maturin develop --release`).
 
 ## License
 
