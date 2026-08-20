@@ -5,8 +5,8 @@ edition = "2024"
 description = "Rule-based Japanese sentence-boundary disambiguation (a faithful, dependency-free Rust port of bunkai)"
 license = "Apache-2.0"
 readme = "README.md"
-repository = "https://github.com/megagonlabs/bunkai"
-keywords = ["japanese", "nlp", "sentence", "segmentation", "boundary", "disambiguation"]
+repository = "https://github.com/gembleman/bunkai_rs"
+keywords = ["japanese", "nlp", "sentence", "segmentation", "boundary"]
 categories = ["text-processing"]
 
 [features]
