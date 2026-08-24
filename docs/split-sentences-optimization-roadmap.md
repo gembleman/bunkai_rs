@@ -58,39 +58,63 @@ scanner가 예외 적용 후에도 유효 경계와 줄바꿈을 찾지 못하�
 위 ASCII bulk skip 효과도 함께 포함된다. 후보가 있는 입력은 기존 `Vec<usize>` 정렬
 경로를 그대로 사용한다.
 
-## 남은 후보
+## P2 실행 결과
 
-### P2 — low emoji block의 compact membership 실험
+### 실험 완료·미반영 — low emoji block compact membership
 
-U+00A9–U+3299 영역은 아직 약 170개 항목을 binary search한다. 이 구간에 대해
-membership bitset과 target bitset을 사용하면 lookup을 고정된 두 bit load로 바꿀 수
-있다. 두 bitset의 합은 약 3.2 KB이므로 기존 table을 완전히 대체하지 않더라도 cache
-비용이 작다.
+U+00A9–U+3299의 상태를 `Absent / NonTarget / Target` 2-bit packed table로 만들어
+binary search와 category flag load를 대체했다. 공개 `EMOJI_DATA`는 그대로 유지했다.
+paired Criterion 결과는 다음과 같다.
 
-ASCII는 이미 빠르게 거절되므로 일반 일본어 corpus에서의 이득은 제한적일 수 있다.
-`emoji-heavy`와 Latin-1/symbol-heavy corpus에서만 유의미하고 혼합 workload에 회귀가
-없을 때 반영한다.
+- 혼합 7 KB: 13.530 us → 13.105 us, 3.43% 개선
+- low-symbol-heavy: 42.904 us → 34.919 us, 18.65% 개선
+- plane-1 emoji/kaomoji: 37.925 us → 38.358 us, 1.44% 회귀
 
-### P2 — allocation과 CPU counter 계측
+low lookup을 `#[inline(never)]` 함수로 격리해 plane-1 hot code의 크기를 줄이는 변형도
+시험했다. 이 경우 low-symbol은 6.66% 개선됐지만 plane-1 emoji/kaomoji가 4.74%
+악화됐다. 특정 symbol workload의 이득보다 일반 emoji workload 회귀가 커서 두 변형
+모두 되돌렸다. low-symbol 전용 8,544 B Criterion corpus는 이후 구현 변형을 비교할 수
+있도록 유지한다.
+
+### 완료 — allocation 계측
+
+`examples/allocation_metrics.rs`에 `System` global allocator를 감싼 독립 계측 도구를
+추가했다. warmup 뒤 counter를 reset하고 `split_sentences()` 한 호출의 성공한
+alloc/realloc 횟수와 요청 byte 합계를 측정한다. 출력과 formatting은 측정 구간 밖에서
+수행한다.
+
+```text
+cargo run --release --example allocation_metrics
+```
+
+| workload | input | allocations/call | allocated bytes/call |
+| --- | ---: | ---: | ---: |
+| empty | 0 B | 0 | 0 |
+| tiny | 1 B | 1 | 16 |
+| no-boundary | 55 B | 1 | 16 |
+| ASCII-heavy | 5,760 B | 8 | 5,112 |
+| medium | 12,544 B | 19 | 37,936 |
+
+빈 입력은 allocation이 없고, 유효 경계가 없는 입력은 결과 `Vec<&str>` 한 번만
+할당한다. 따라서 P1의 내부 boundary allocation 제거가 의도대로 작동함을 수치로
+고정했다.
+
+## 남은 검증 후보
+
+### CPU counter와 타 architecture
 
 Criterion latency/throughput만으로는 fast path의 개선 원인을 구분하기 어렵다. 다음
-측정을 별도 bench 또는 profiler에 추가한다.
+측정은 호스트 권한이나 별도 실행 환경이 필요하다.
 
-- allocations/call과 allocated bytes/call
 - cycles/byte, instructions/byte, branch misses
-- 0 B, tiny, no-boundary, ASCII-heavy, CJK/Kana, emoji-heavy, newline-dense
 - x86-64와 AArch64
-
-특히 allocation-free 단일 문장 경로는 latency뿐 아니라 allocations/call 감소를 필수
-통과 조건으로 삼는다.
 
 ## 다음 실행 순서
 
-1. allocations/call 계측을 추가해 단일 문장 경로의 allocation 감소를 수치로 고정한다.
-2. low emoji bitset은 emoji/symbol-heavy baseline을 먼저 추가한 뒤 실험한다.
-3. AArch64에서도 ASCII SWAR의 개선과 혼합 workload 무회귀를 확인한다.
+1. AArch64에서 ASCII SWAR의 개선과 혼합 workload 무회귀를 확인한다.
+2. `perf_event_paranoid`가 허용되는 호스트에서 CPU counter를 수집한다.
+3. low emoji lookup은 plane-1 회귀를 구조적으로 피할 새 설계가 있을 때만 재실험한다.
 4. 각 변경은 독립 commit과 Criterion baseline으로 유지해 회귀 시 즉시 제거한다.
 
-두 P1 후보는 반영을 완료했다. 다음 구현 후보는 low emoji bitset이지만, 일반 일본어
-입력보다 특수 symbol workload에 치우친 최적화이므로 전용 baseline 없이 적용하지
-않는다. `Vec<Bound>` 직접 소비 방식은 실제 측정상 회귀했으므로 계속 제외한다.
+두 P1 후보와 allocation 계측은 반영을 완료했다. low emoji bitset과 `Vec<Bound>` 직접
+소비 방식은 특정 workload의 이득보다 다른 중요 workload의 회귀가 확인되어 제외한다.

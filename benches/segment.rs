@@ -89,6 +89,23 @@ fn punctuation_dense_text() -> String {
     FRAGMENT.repeat(128)
 }
 
+/// Low-codepoint symbols exercise the U+00A9..U+3299 emoji lookup block. The
+/// corpus mixes target entries (symbols and smileys), non-target emoji entries
+/// (objects, travel, food, and activities), absent neighbors, and ordinary
+/// Latin-1/CJK text in UI-like notifications rather than repeating one symbol.
+fn low_symbol_heavy_text() -> String {
+    const FRAGMENT: &str = concat!(
+        "Support © 2026 Acme® — status=ok™; info ℹ️. ",
+        "sync ↔ backup ↕ 75% / ready? ",
+        "weather ☀ ☁ ☂ ☃; meeting ⌚ 09:30; coffee ☕. ",
+        "security ⚠ ✅ ☑; call ☎ / mobile ✆; score ★ ☆. ",
+        "reaction ☺ ☹ ❤ ❓ ❗; event ⚽ ♠ ✈. ",
+        "low symbols 〰 〽 ㊗ ㊙; plain § ± × ÷ • °. ",
+        "Latin café naïve, CJK メモと確認です。\n",
+    );
+    FRAGMENT.repeat(24)
+}
+
 /// A long, terminator-free run isolates scanning cost when no boundaries are
 /// emitted. It intentionally contains spaces and digits but no sentence mark.
 fn no_boundary_text() -> String {
@@ -153,6 +170,7 @@ fn bench_all(c: &mut Criterion) {
         ("ascii-heavy", ascii_heavy_text()),
         ("cjk-kana", cjk_kana_text()),
         ("emoji-kaomoji", emoji_kaomoji_text()),
+        ("low-symbol-heavy", low_symbol_heavy_text()),
         ("punctuation-dense", punctuation_dense_text()),
         ("no-boundary", no_boundary_text()),
         ("newline-sparse", newline_sparse_text()),
