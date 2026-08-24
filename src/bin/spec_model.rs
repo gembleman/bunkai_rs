@@ -317,7 +317,8 @@ fn emoji_runs(chars: &[char]) -> Vec<Span> {
     let n = chars.len();
     let mut out = Vec::new();
     for i in 0..n {
-        if emoji_entry(chars[i]).is_none() || !is_run_start(chars, i, |c| emoji_entry(c).is_some()) {
+        if emoji_entry(chars[i]).is_none() || !is_run_start(chars, i, |c| emoji_entry(c).is_some())
+        {
             continue;
         }
         let j = run_end(chars, i, |c| emoji_entry(c).is_some());
@@ -535,9 +536,7 @@ pub(crate) fn spec_boundaries(text: &str) -> Vec<usize> {
 use std::collections::HashSet;
 use std::process::exit;
 
-use bunkai_rs::{
-    segment, sentence_byte_boundaries, split_sentences,
-};
+use bunkai_rs::{segment, sentence_byte_boundaries, split_sentences};
 
 // ---- corpora ---------------------------------------------------------------
 
@@ -862,7 +861,9 @@ fn check_golden() -> Result<(), String> {
     }
     for (text, expected) in &cases {
         if &spec_boundaries(text) != expected {
-            return Err(format!("spec vs golden diverged on {text:?} (expected {expected:?})"));
+            return Err(format!(
+                "spec vs golden diverged on {text:?} (expected {expected:?})"
+            ));
         }
     }
     Ok(())

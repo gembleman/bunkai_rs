@@ -12,11 +12,12 @@
 ///   definition (25 codepoints, verified empirically). This removes the
 ///   byte→char offset translation both regular expressions required.
 /// * The emoji category table is a sorted, unique `&[(u32, Option<&str>)]`
-///   that is binary-searched instead of being built into a `HashMap`.
+///   that is binary-searched instead of being built into a `HashMap`. Hot-path
+///   lookup uses a compact three-state `u8`; the public category table remains
+///   unchanged.
 /// * `unify_span_annotations` sorts and dedups in place instead of building a
 ///   `HashMap` keyed by a formatted string.
 use std::cell::OnceCell;
-use std::collections::HashMap;
 
 use crate::emoji_data;
 
@@ -266,16 +267,6 @@ impl<'a> PipelineState<'a> {
         &self.layers[self.final_index].spans
     }
 
-    fn final_spans_mut(&mut self) -> &mut Vec<SpanRecord<'a>> {
-        &mut self.layers[self.final_index].spans
-    }
-
-    /// Rename the current (final) layer. Used by the exception stages, which
-    /// filter the cumulative layer in place instead of building a fresh one.
-    fn rename_final_layer(&mut self, name: &'static str) {
-        self.layers[self.final_index].name = name;
-    }
-
     fn add_layer(&mut self, name: &'static str, spans: Vec<SpanRecord<'a>>) {
         let idx = self.layers.len();
         self.layers.push(LayerOutput { name, spans });
@@ -398,15 +389,34 @@ fn is_face_symbol1(ch: char) -> bool {
     is_ascii_alnum(ch) || is_fullwidth_alnum(ch) || is_face_symbol2(ch)
 }
 
-/// Existence + category of an emoji codepoint, via binary search over the
-/// sorted, unique `emoji_data::EMOJI_DATA`.
+/// Compact hot-path result for [`emoji_lookup`]. `EMOJI_NON_TARGET` includes
+/// entries whose public category is `None` (for example skin-tone modifiers):
+/// they belong to emoji runs, but do not make a run a target run.
+const EMOJI_ABSENT: u8 = 0;
+const EMOJI_NON_TARGET: u8 = 1;
+const EMOJI_TARGET: u8 = 2;
+
+/// Whether a public emoji category contributes to a target emoji run.
+const fn emoji_category_is_target(category: Option<&str>) -> bool {
+    let Some(category) = category else {
+        return false;
+    };
+    let mut i = 0;
+    while i < TARGET_EMOJI_CATEGORIES.len() {
+        if str_eq(category, TARGET_EMOJI_CATEGORIES[i]) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Existence and target membership of an emoji codepoint, via binary search
+/// over the sorted, unique `emoji_data::EMOJI_DATA`.
 ///
-/// Returns `Some(entry)` when the codepoint IS present in the emoji table
-/// (`entry` is the stored category, which may itself be `None` for e.g.
-/// skin-tone modifiers), and `None` when the codepoint is not an emoji at
-/// all. The original port keyed membership by table presence — a codepoint
-/// with a `None` category still belongs to emoji *runs* — so callers must
-/// distinguish those two cases.
+/// The returned `u8` is one of `EMOJI_ABSENT`, `EMOJI_NON_TARGET`, or
+/// `EMOJI_TARGET`. The category strings are intentionally not loaded on this
+/// hot path; the public `EMOJI_DATA` table remains available unchanged.
 ///
 /// The table has a huge hole between the low block (`0xA9..0x3299`, 170
 /// entries) and the plane-1 block (`0x1F004..`, 1230 entries): the whole
@@ -428,27 +438,30 @@ const EMOJI_LOW_END: usize = first_ge(emoji_data::EMOJI_DATA, 0x3300);
 const EMOJI_HIGH_START: usize = first_ge(emoji_data::EMOJI_DATA, 0x1F000);
 
 /// Direct-indexed lookup for the plane-1 emoji block: `EMOJI_HIGH_LOOKUP[cp -
-/// 0x1F000]` is the codepoint's index into `EMOJI_DATA`, or `u16::MAX` if the
-/// codepoint isn't in the table. Replaces an ~11-iteration binary search (a
-/// dependent-load chain with a ~50%-mispredicted data-dependent branch) with a
-/// single address-known load. The plane-1 block is dense (1230 entries over
-/// ~2.8K codepoints) so the table is small (~5.6 KB) and `u16` comfortably
-/// indexes `EMOJI_DATA` (1400 entries, `EMOJI_DATA.len() < u16::MAX`).
+/// 0x1F000]` is the codepoint's compact three-state result, or
+/// `EMOJI_ABSENT` if the codepoint isn't in the table. Replaces an ~11-iteration
+/// binary search (a dependent-load chain with a ~50%-mispredicted data-dependent
+/// branch) with a single address-known load. The table is one byte per codepoint
+/// (~2.8 KB), and avoids the former index-plus-category loads.
 const EMOJI_HIGH_SPAN: usize =
     (emoji_data::EMOJI_DATA[emoji_data::EMOJI_DATA.len() - 1].0 - 0x1F000 + 1) as usize;
-const EMOJI_HIGH_LOOKUP: [u16; EMOJI_HIGH_SPAN] = build_emoji_high_lookup();
-const fn build_emoji_high_lookup() -> [u16; EMOJI_HIGH_SPAN] {
+const EMOJI_HIGH_LOOKUP: [u8; EMOJI_HIGH_SPAN] = build_emoji_high_lookup();
+const fn build_emoji_high_lookup() -> [u8; EMOJI_HIGH_SPAN] {
     let data = emoji_data::EMOJI_DATA;
-    let mut table = [u16::MAX; EMOJI_HIGH_SPAN];
+    let mut table = [EMOJI_ABSENT; EMOJI_HIGH_SPAN];
     let mut i = EMOJI_HIGH_START;
     while i < data.len() {
         let slot = (data[i].0 - 0x1F000) as usize;
-        table[slot] = i as u16;
+        table[slot] = if emoji_category_is_target(data[i].1) {
+            EMOJI_TARGET
+        } else {
+            EMOJI_NON_TARGET
+        };
         i += 1;
     }
     table
 }
-const _: () = assert!(emoji_data::EMOJI_DATA.len() < u16::MAX as usize);
+const _: () = assert!(emoji_data::EMOJI_DATA[0].0 >= 0xA9);
 
 /// `&str` equality usable in a `const` context (`PartialEq` for `str` is not
 /// yet const-stable). Used to precompute `EMOJI_TARGET` against the
@@ -470,11 +483,11 @@ const fn str_eq(a: &str, b: &str) -> bool {
 }
 
 /// Per-`EMOJI_DATA`-index target flag: 1 iff the emoji's category is one of
-/// `TARGET_EMOJI_CATEGORIES`. Precomputed so the hot emoji-run scan does a
+/// `TARGET_EMOJI_CATEGORIES`. Precomputed so the low-block lookup does a
 /// single `bool` test instead of a `&str` byte comparison (opportunity (5) in
 /// `docs/optimization-hardware.md`). `EMOJI_DATA`'s `&str` categories stay
 /// untouched — they are still used by the spec model and the low/high lookups.
-const EMOJI_TARGET: [u8; emoji_data::EMOJI_DATA.len()] = {
+const EMOJI_TARGET_FLAGS: [u8; emoji_data::EMOJI_DATA.len()] = {
     let mut arr = [0u8; emoji_data::EMOJI_DATA.len()];
     let mut i = 0;
     while i < emoji_data::EMOJI_DATA.len() {
@@ -496,18 +509,20 @@ const EMOJI_TARGET: [u8; emoji_data::EMOJI_DATA.len()] = {
 /// A hand-written lower-bound loop instead of `slice::binary_search_by_key`
 /// so the whole lookup inlines into the scanning hot loop.
 ///
-/// Returns `(category, is_target)`: `category` is the emoji's `&str` group (or
-/// `None`), and `is_target` is the precomputed `category ∈ TARGET_EMOJI_CATEGORIES`
-/// flag so callers avoid a `&str` byte comparison on the hot path.
 #[inline]
-fn emoji_lookup(codepoint: u32) -> Option<(Option<&'static str>, bool)> {
+fn emoji_lookup(codepoint: u32) -> u8 {
+    // EMOJI_DATA's minimum is U+00A9 (asserted above), so all ASCII and the
+    // remaining C0/C1 controls can be rejected before touching the table.
+    if codepoint < 0xA9 {
+        return EMOJI_ABSENT;
+    }
     // Fast reject for the dominant emoji-free Japanese ranges: kana (hiragana
     // + katakana) and the katakana phonetic extensions sit below 0x3300, so
     // they would otherwise fall into the ~170-entry low-block binary search on
     // every single character. The ranges hold no emoji (verified against the
     // table: the nearest low-block emoji are 0x3030/0x303D/0x3297/0x3299).
     if (0x3040..=0x30FF).contains(&codepoint) || (0x31F0..=0x31FF).contains(&codepoint) {
-        return None;
+        return EMOJI_ABSENT;
     }
     let data = emoji_data::EMOJI_DATA;
     if codepoint < 0x3300 {
@@ -521,29 +536,28 @@ fn emoji_lookup(codepoint: u32) -> Option<(Option<&'static str>, bool)> {
             }
         }
         return if lo < data.len() && data[lo].0 == codepoint {
-            Some((data[lo].1, EMOJI_TARGET[lo] == 1))
+            if EMOJI_TARGET_FLAGS[lo] == 1 {
+                EMOJI_TARGET
+            } else {
+                EMOJI_NON_TARGET
+            }
         } else {
-            None
+            EMOJI_ABSENT
         };
     }
     if codepoint < 0x1F000 {
         // The entire CJK/kanji range is emoji-free — this is the hot path
         // for ordinary Japanese prose.
         debug_assert_eq!(EMOJI_LOW_END, EMOJI_HIGH_START);
-        return None;
+        return EMOJI_ABSENT;
     }
     // Plane-1 block: direct-indexed, no dependent-load binary search (see
     // `EMOJI_HIGH_LOOKUP`).
     let slot = (codepoint - 0x1F000) as usize;
     if slot >= EMOJI_HIGH_LOOKUP.len() {
-        return None;
+        return EMOJI_ABSENT;
     }
-    let idx = EMOJI_HIGH_LOOKUP[slot];
-    if idx == u16::MAX {
-        None
-    } else {
-        Some((data[idx as usize].1, EMOJI_TARGET[idx as usize] == 1))
-    }
+    EMOJI_HIGH_LOOKUP[slot]
 }
 const _: () = assert!(EMOJI_LOW_END == EMOJI_HIGH_START);
 
@@ -696,8 +710,8 @@ fn scan_all_with<E: Emit>(chars: &[char], out: &mut E) {
                 }
             }
             _ => {
-                if emoji_lookup(ch as u32).is_some() {
-                    if i == 0 || emoji_lookup(chars[i - 1] as u32).is_none() {
+                if emoji_lookup(ch as u32) != EMOJI_ABSENT {
+                    if i == 0 || emoji_lookup(chars[i - 1] as u32) == EMOJI_ABSENT {
                         scan_emoji_run(chars, len, i, out);
                     }
                 } else if is_ws(ch) {
@@ -801,13 +815,14 @@ fn scan_emotion_symbol_run<E: Emit>(chars: &[char], len: usize, i: usize, out: &
 fn scan_emoji_run<E: Emit>(chars: &[char], len: usize, i: usize, out: &mut E) {
     let start = i;
     let mut j = i;
-    let mut any_target = emoji_lookup(chars[j] as u32).is_some_and(|(_, t)| t);
+    let mut any_target = emoji_lookup(chars[j] as u32) == EMOJI_TARGET;
     j += 1;
     while j < len {
-        let Some((_, is_target)) = emoji_lookup(chars[j] as u32) else {
+        let status = emoji_lookup(chars[j] as u32);
+        if status == EMOJI_ABSENT {
             break;
-        };
-        if is_target {
+        }
+        if status == EMOJI_TARGET {
             any_target = true;
         }
         j += 1;
@@ -842,6 +857,7 @@ fn chars_range_eq(chars: &[char], start: usize, word: &str) -> bool {
 }
 
 pub(crate) fn segment_impl(text: &str) -> PipelineOutput<'_> {
+    assert_offset_capacity(text);
     let prof_base = prof::enter();
     let view = TextView::new(text);
     prof::begin("new(TextView)");
@@ -898,23 +914,19 @@ pub(crate) fn segment_impl(text: &str) -> PipelineOutput<'_> {
 
 fn apply_indirect_quote<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) {
     prof::begin("i.unify");
-    // The final layer is already sorted by `(start, end)` — maintained by the
-    // merge in `filter_previous_rule_same_span` — so filtering in place keeps
-    // it sorted and the old `sort_unstable_by` (the dominant cost of this
-    // stage) is no longer needed. `retain` only memmoves survivors within the
-    // one buffer, dropping the per-record clone the old `Vec::push(span.clone())`
-    // did.
-    state.final_spans_mut().retain(|span| {
-        !is_exception_particle(view, span.end as usize)
-    });
+    // Every public layer is a snapshot of the cumulative pipeline at that
+    // stage.  Filtering a layer in place would silently rewrite the preceding
+    // BasicRule snapshot, so clone the compact borrowed records before the
+    // exception stage and append the filtered result as a new layer.
+    let mut spans = state.final_spans().to_vec();
+    spans.retain(|span| !is_exception_particle(view, span.end as usize));
     debug_assert!(
-        state
-            .final_spans()
+        spans
             .windows(2)
             .all(|w| w[0].start != w[1].start || w[0].end != w[1].end)
     );
     prof::end();
-    state.rename_final_layer("IndirectQuoteExceptionAnnotator");
+    state.add_layer("IndirectQuoteExceptionAnnotator", spans);
 }
 
 fn is_exception_particle(view: &TextView<'_>, end: usize) -> bool {
@@ -982,13 +994,12 @@ fn unify_span_annotations(spans: Vec<SpanRecord<'_>>) -> Vec<SpanRecord<'_>> {
 }
 
 fn apply_dot_exception<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) {
-    // Filter in place: the cumulative layer is already `(start, end)`-sorted,
-    // so `retain` preserves that order (no re-sort, no per-record clone).
-    state.final_spans_mut().retain(|span| {
+    let mut spans = state.final_spans().to_vec();
+    spans.retain(|span| {
         !(is_exception_numeric(view, span.start as usize)
             || is_exception_mailaddress(view, span.start as usize))
     });
-    state.rename_final_layer("DotExceptionAnnotator");
+    state.add_layer("DotExceptionAnnotator", spans);
 }
 
 fn is_exception_numeric(view: &TextView<'_>, index: usize) -> bool {
@@ -1070,7 +1081,8 @@ fn is_mail_char(ch: char) -> bool {
 }
 
 fn apply_number_exception<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) {
-    state.final_spans_mut().retain(|span| {
+    let mut spans = state.final_spans().to_vec();
+    spans.retain(|span| {
         !is_exception_no_parts(
             view,
             span.start as usize,
@@ -1078,7 +1090,7 @@ fn apply_number_exception<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>
             is_dot_value(span.split_value),
         )
     });
-    state.rename_final_layer("NumberExceptionAnnotator");
+    state.add_layer("NumberExceptionAnnotator", spans);
 }
 
 fn is_exception_no_parts(
@@ -1120,28 +1132,30 @@ fn apply_linebreak_force<'a>(
     state: &mut PipelineState<'a>,
     linebreaks: &[(usize, usize)],
 ) {
-    let mut map: HashMap<usize, (usize, usize)> = linebreaks
-        .iter()
-        .map(|&(start, end)| (start, (start, end)))
-        .collect();
-
-    // 1:1 transform: each final span is either kept (in place) or replaced by
-    // the linebreak run whose start equals its end; unmatched linebreaks are
-    // appended after. This overwrites the buffer in place instead of cloning
-    // every kept span into a fresh `Vec`.
-    {
-        let spans = state.final_spans_mut();
-        for span in spans.iter_mut() {
-            if let Some((lb_start, lb_end)) = map.remove(&(span.end as usize)) {
-                *span = SpanRecord {
-                    kind: Kind::Linebreak,
-                    start: lb_start as u32,
-                    end: lb_end as u32,
-                    split_value: Some(view.slice(lb_start, lb_end)),
-                };
-            }
+    // 1:1 transform: each final span is either kept or replaced by the
+    // linebreak run whose start equals its end; unmatched linebreaks are
+    // appended after. Work on a copy so every previous snapshot remains
+    // observable through the public API.
+    let mut spans = state.final_spans().to_vec();
+    let mut consumed = vec![false; linebreaks.len()];
+    for span in spans.iter_mut() {
+        let Ok(i) = linebreaks.binary_search_by_key(&(span.end as usize), |&(start, _)| start)
+        else {
+            continue;
+        };
+        if !consumed[i] {
+            consumed[i] = true;
+            let (lb_start, lb_end) = linebreaks[i];
+            *span = SpanRecord {
+                kind: Kind::Linebreak,
+                start: lb_start as u32,
+                end: lb_end as u32,
+                split_value: Some(view.slice(lb_start, lb_end)),
+            };
         }
-        for (_, (start, end)) in map {
+    }
+    for (i, &(start, end)) in linebreaks.iter().enumerate() {
+        if !consumed[i] {
             spans.push(SpanRecord {
                 kind: Kind::Linebreak,
                 start: start as u32,
@@ -1150,7 +1164,7 @@ fn apply_linebreak_force<'a>(
             });
         }
     }
-    state.rename_final_layer("LinebreakForceAnnotator");
+    state.add_layer("LinebreakForceAnnotator", spans);
 }
 
 /// Compact span for the boundaries-only fast path used by [`split_sentences`].
@@ -1178,6 +1192,7 @@ struct Bound {
 /// bytes — verified by the golden/differential suites and the
 /// bounds-vs-pipeline property test.
 pub fn sentence_byte_boundaries(text: &str) -> Vec<usize> {
+    assert_offset_capacity(text);
     let len = text.len();
     let mut active: Vec<Bound> = Vec::new();
     let mut linebreaks: Vec<(usize, usize)> = Vec::new();
@@ -1191,9 +1206,7 @@ pub fn sentence_byte_boundaries(text: &str) -> Vec<usize> {
         if is_exception_particle_bytes(text, end) {
             return false;
         }
-        if is_exception_numeric_bytes(text, start)
-            || is_exception_mailaddress_bytes(text, start)
-        {
+        if is_exception_numeric_bytes(text, start) || is_exception_mailaddress_bytes(text, start) {
             return false;
         }
         // A span whose whole matched text is "." / "．" iff it spans exactly
@@ -1232,6 +1245,11 @@ pub fn sentence_byte_boundaries(text: &str) -> Vec<usize> {
     ends.sort_unstable();
     ends.dedup();
     ends
+}
+
+#[inline]
+fn assert_offset_capacity(text: &str) {
+    u32::try_from(text.len()).expect("bunkai_rs inputs must not exceed u32::MAX bytes");
 }
 
 /// Infallible decoding of the scalar value at byte offset `b` of a valid UTF-8
@@ -1421,7 +1439,7 @@ fn cjk_run_is_boring(bytes: &[u8], start: usize, end: usize) -> bool {
             && !is_basic_punct(c)
             && !is_ws(c)
             && !EMOTION_SYMBOLS.contains(&c)
-            && emoji_lookup(c as u32).is_none();
+            && emoji_lookup(c as u32) == EMOJI_ABSENT;
         if !boring {
             return false;
         }
@@ -1442,7 +1460,7 @@ fn scan_bounds_bytes(text: &str, active: &mut Vec<Bound>, linebreaks: &mut Vec<(
     let len = bytes.len();
     let mut b = 0usize;
     let mut prev: Option<char> = None;
-    // Caches `prev.is_some_and(|p| emoji_lookup(p as u32).is_some())` so the
+    // Caches `prev.is_some_and(|p| emoji_lookup(p as u32) != EMOJI_ABSENT)` so the
     // dispatch doesn't re-run `emoji_lookup` on `prev` every iteration: none
     // of the punctuation/kaomoji trigger chars matched by the other arms are
     // in `EMOJI_DATA`, so `is_emoji` is exactly that predicate for every `ch`.
@@ -1484,7 +1502,7 @@ fn scan_bounds_bytes(text: &str, active: &mut Vec<Bound>, linebreaks: &mut Vec<(
                 }
             }
             _ => {
-                is_emoji = emoji_lookup(ch as u32).is_some();
+                is_emoji = emoji_lookup(ch as u32) != EMOJI_ABSENT;
                 if is_emoji {
                     if !prev_is_emoji {
                         scan_emoji_run_bytes(bytes, len, b, active);
@@ -1543,12 +1561,7 @@ fn scan_basic_run_bytes(bytes: &[u8], len: usize, start: usize, active: &mut Vec
 }
 
 /// A maximal run of `…★☆♪` plus (if present) exactly one following punctuator.
-fn scan_emotion_symbol_run_bytes(
-    bytes: &[u8],
-    len: usize,
-    start: usize,
-    active: &mut Vec<Bound>,
-) {
+fn scan_emotion_symbol_run_bytes(bytes: &[u8], len: usize, start: usize, active: &mut Vec<Bound>) {
     let mut j = start;
     while j < len {
         let (c, n) = char_at_byte(bytes, j);
@@ -1576,10 +1589,11 @@ fn scan_emoji_run_bytes(bytes: &[u8], len: usize, start: usize, active: &mut Vec
     let mut any_target = false;
     while j < len {
         let (c, n) = char_at_byte(bytes, j);
-        let Some((_, is_target)) = emoji_lookup(c as u32) else {
+        let status = emoji_lookup(c as u32);
+        if status == EMOJI_ABSENT {
             break;
-        };
-        if is_target {
+        }
+        if status == EMOJI_TARGET {
             any_target = true;
         }
         j += n;
@@ -1680,9 +1694,7 @@ fn is_exception_particle_bytes(text: &str, end: usize) -> bool {
         return false;
     }
     let mut idx = end;
-    while idx < len
-        && char_at_byte_opt(bytes, idx).is_some_and(|(c, _)| c == '\n')
-        && idx + 1 < len
+    while idx < len && char_at_byte_opt(bytes, idx).is_some_and(|(c, _)| c == '\n') && idx + 1 < len
     {
         idx += 1;
     }
@@ -1792,10 +1804,7 @@ fn is_exception_no_parts_bytes(text: &str, start: usize, end: usize, is_dot: boo
     next_char.is_ascii_digit()
 }
 
-fn apply_linebreak_force_bounds(
-    active: Vec<Bound>,
-    linebreaks: &[(usize, usize)],
-) -> Vec<Bound> {
+fn apply_linebreak_force_bounds(active: Vec<Bound>, linebreaks: &[(usize, usize)]) -> Vec<Bound> {
     // A HashMap is overkill here: `linebreaks` already arrives from the scanner
     // sorted by ascending start with unique starts, so each bound's end is
     // looked up against the linebreak starts with a binary search — no hashing
@@ -1872,20 +1881,22 @@ fn filter_previous_rule_same_span<'a>(
         match (ci.peek(), previous.get(pi)) {
             (Some(c), Some(p)) => {
                 if (c.start, c.end) <= (p.start, p.end) {
-                    if (c.start as usize, c.end as usize) != sentinel_key {
-                        out.push(c.clone());
+                    let key = (c.start as usize, c.end as usize);
+                    let c = ci.next().expect("peeked current span");
+                    if key != sentinel_key {
+                        out.push(c);
                     }
-                    ci.next();
                 } else {
                     out.push(p.clone());
                     pi += 1;
                 }
             }
             (Some(c), None) => {
-                if (c.start as usize, c.end as usize) != sentinel_key {
-                    out.push(c.clone());
+                let key = (c.start as usize, c.end as usize);
+                let c = ci.next().expect("peeked current span");
+                if key != sentinel_key {
+                    out.push(c);
                 }
-                ci.next();
             }
             (None, Some(p)) => {
                 out.push(p.clone());
@@ -2037,6 +2048,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn emoji_lookup_uses_compact_three_state_results() {
+        assert_eq!(emoji_lookup(0x00A8), EMOJI_ABSENT);
+        assert_eq!(emoji_lookup(0x00A9), EMOJI_TARGET);
+        assert_eq!(emoji_lookup(0x1F3FB), EMOJI_NON_TARGET);
+        assert_eq!(emoji_lookup(0x1F600), EMOJI_TARGET);
+
+        // Every public entry remains represented, including entries with no
+        // category (skin-tone modifiers), while the public table itself stays
+        // the source of compatibility-visible category data.
+        assert_eq!(emoji_data::EMOJI_DATA[0].0, 0x00A9);
+        for &(codepoint, category) in emoji_data::EMOJI_DATA {
+            let expected = if emoji_category_is_target(category) {
+                EMOJI_TARGET
+            } else {
+                EMOJI_NON_TARGET
+            };
+            assert_eq!(emoji_lookup(codepoint), expected, "U+{codepoint:04X}");
+        }
+    }
+
+    #[test]
     fn face_mark_detection_matches_reference() {
         let text = "顔文字(*^_^*)だよ。";
         let view = TextView::new(text);
@@ -2174,7 +2206,10 @@ mod tests {
                 debug_assert_eq!(via_pipeline[bi], text.chars().count());
                 via_pipeline_bytes.push(text.len());
             }
-            assert_eq!(via_bounds, via_pipeline_bytes, "byte-skip diverged on {text:?}");
+            assert_eq!(
+                via_bounds, via_pipeline_bytes,
+                "byte-skip diverged on {text:?}"
+            );
         }
     }
 
@@ -2521,18 +2556,20 @@ mod tests {
             // Skip plain characters; a run starts on an emoji codepoint. Table
             // membership is what matters — "emoji" includes codepoints whose
             // stored category is `None`, e.g. skin-tone modifiers.
-            let Some((_, first_target)) = emoji_lookup(view.chars[i] as u32) else {
+            let first_status = emoji_lookup(view.chars[i] as u32);
+            if first_status == EMOJI_ABSENT {
                 i += 1;
                 continue;
-            };
+            }
             let start = i;
-            let mut any_target = first_target;
+            let mut any_target = first_status == EMOJI_TARGET;
             i += 1;
             while i < len {
-                let Some((_, is_target)) = emoji_lookup(view.chars[i] as u32) else {
+                let status = emoji_lookup(view.chars[i] as u32);
+                if status == EMOJI_ABSENT {
                     break;
-                };
-                if is_target {
+                }
+                if status == EMOJI_TARGET {
                     any_target = true;
                 }
                 i += 1;

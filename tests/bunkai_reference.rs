@@ -481,3 +481,167 @@ fn test_multibyte_offsets_are_char_offsets() {
     assert_eq!(seg.final_boundaries, vec![6, 16]);
     assert_eq!(sentences(text), vec!["日本語です。", "Englishです。"]);
 }
+
+#[test]
+fn test_segment_preserves_every_pipeline_layer_snapshot() {
+    // This input exercises every annotator and each of the four exception
+    // stages.  The expected snapshots are deliberately written as literals:
+    // checking only the final boundaries would miss a stage mutating its
+    // predecessor in place.
+    let text = "★ A?て😀。3.5 No.1(^_^)\n";
+    let seg = segment(text);
+
+    assert_eq!(
+        seg.layers
+            .iter()
+            .map(|layer| layer.name)
+            .collect::<Vec<_>>(),
+        vec![
+            "first",
+            "FaceMarkDetector",
+            "EmotionExpressionAnnotator",
+            "EmojiAnnotator",
+            "BasicRule",
+            "IndirectQuoteExceptionAnnotator",
+            "DotExceptionAnnotator",
+            "NumberExceptionAnnotator",
+            "LinebreakForceAnnotator",
+        ]
+    );
+    assert_eq!(seg.layers.len(), 9);
+
+    type ExpectedSpan<'a> = (
+        &'static str,
+        usize,
+        usize,
+        Option<&'static str>,
+        Option<&'a str>,
+    );
+    let expected: &[&[ExpectedSpan<'_>]] = &[
+        &[("first", 20, 21, None, None)],
+        &[
+            ("FaceMarkDetector", 15, 20, Some("facemark"), Some("(^_^)")),
+            ("first", 20, 21, None, None),
+        ],
+        &[
+            (
+                "EmotionExpressionAnnotator",
+                0,
+                1,
+                Some("EmotionExpressionAnnotator"),
+                Some("★"),
+            ),
+            ("FaceMarkDetector", 15, 20, Some("facemark"), Some("(^_^)")),
+            ("first", 20, 21, None, None),
+        ],
+        &[
+            (
+                "EmotionExpressionAnnotator",
+                0,
+                1,
+                Some("EmotionExpressionAnnotator"),
+                Some("★"),
+            ),
+            ("EmojiAnnotator", 5, 6, Some("EmojiAnnotator"), Some("😀")),
+            ("FaceMarkDetector", 15, 20, Some("facemark"), Some("(^_^)")),
+            ("first", 20, 21, None, None),
+        ],
+        &[
+            (
+                "EmotionExpressionAnnotator",
+                0,
+                1,
+                Some("EmotionExpressionAnnotator"),
+                Some("★"),
+            ),
+            ("BasicRule", 3, 4, Some("BasicRule"), Some("?")),
+            ("EmojiAnnotator", 5, 6, Some("EmojiAnnotator"), Some("😀")),
+            ("BasicRule", 6, 7, Some("BasicRule"), Some("。")),
+            ("BasicRule", 8, 9, Some("BasicRule"), Some(".")),
+            ("BasicRule", 13, 14, Some("BasicRule"), Some(".")),
+            ("FaceMarkDetector", 15, 20, Some("facemark"), Some("(^_^)")),
+            ("first", 20, 21, None, None),
+        ],
+        &[
+            (
+                "EmotionExpressionAnnotator",
+                0,
+                1,
+                Some("EmotionExpressionAnnotator"),
+                Some("★"),
+            ),
+            ("EmojiAnnotator", 5, 6, Some("EmojiAnnotator"), Some("😀")),
+            ("BasicRule", 6, 7, Some("BasicRule"), Some("。")),
+            ("BasicRule", 8, 9, Some("BasicRule"), Some(".")),
+            ("BasicRule", 13, 14, Some("BasicRule"), Some(".")),
+            ("FaceMarkDetector", 15, 20, Some("facemark"), Some("(^_^)")),
+            ("first", 20, 21, None, None),
+        ],
+        &[
+            (
+                "EmotionExpressionAnnotator",
+                0,
+                1,
+                Some("EmotionExpressionAnnotator"),
+                Some("★"),
+            ),
+            ("EmojiAnnotator", 5, 6, Some("EmojiAnnotator"), Some("😀")),
+            ("BasicRule", 6, 7, Some("BasicRule"), Some("。")),
+            ("FaceMarkDetector", 15, 20, Some("facemark"), Some("(^_^)")),
+            ("first", 20, 21, None, None),
+        ],
+        &[
+            (
+                "EmotionExpressionAnnotator",
+                0,
+                1,
+                Some("EmotionExpressionAnnotator"),
+                Some("★"),
+            ),
+            ("EmojiAnnotator", 5, 6, Some("EmojiAnnotator"), Some("😀")),
+            ("BasicRule", 6, 7, Some("BasicRule"), Some("。")),
+            ("FaceMarkDetector", 15, 20, Some("facemark"), Some("(^_^)")),
+            ("first", 20, 21, None, None),
+        ],
+        &[
+            (
+                "EmotionExpressionAnnotator",
+                0,
+                1,
+                Some("EmotionExpressionAnnotator"),
+                Some("★"),
+            ),
+            ("EmojiAnnotator", 5, 6, Some("EmojiAnnotator"), Some("😀")),
+            ("BasicRule", 6, 7, Some("BasicRule"), Some("。")),
+            (
+                "LinebreakForceAnnotator",
+                20,
+                21,
+                Some("linebreak"),
+                Some("\n"),
+            ),
+            ("first", 20, 21, None, None),
+        ],
+    ];
+
+    for (layer, expected_spans) in seg.layers.iter().zip(expected) {
+        let actual: Vec<ExpectedSpan<'_>> = layer
+            .spans
+            .iter()
+            .map(|span| {
+                (
+                    span.rule_name,
+                    span.start,
+                    span.end,
+                    span.split_type,
+                    span.split_value,
+                )
+            })
+            .collect();
+        assert_eq!(
+            actual, *expected_spans,
+            "snapshot mismatch in {:?}",
+            layer.name
+        );
+    }
+}
