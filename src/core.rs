@@ -1179,6 +1179,13 @@ struct Bound {
     end: u32,
 }
 
+/// Internal result that avoids allocating a one-element boundary vector when
+/// the scanner finds no effective boundary before the end of the input.
+enum ByteBoundaries {
+    WholeText,
+    Multiple(Vec<usize>),
+}
+
 /// Compute the final sentence-boundary offsets as *byte* offsets, without
 /// materialising any annotation layer, any `Vec<char>` or the `char→byte` map
 /// — the fast path behind [`split_sentences`].
@@ -1192,6 +1199,13 @@ struct Bound {
 /// bytes — verified by the golden/differential suites and the
 /// bounds-vs-pipeline property test.
 pub fn sentence_byte_boundaries(text: &str) -> Vec<usize> {
+    match compute_byte_boundaries(text) {
+        ByteBoundaries::WholeText => vec![text.len()],
+        ByteBoundaries::Multiple(boundaries) => boundaries,
+    }
+}
+
+fn compute_byte_boundaries(text: &str) -> ByteBoundaries {
     assert_offset_capacity(text);
     let len = text.len();
     let mut active: Vec<Bound> = Vec::new();
@@ -1229,12 +1243,15 @@ pub fn sentence_byte_boundaries(text: &str) -> Vec<usize> {
     // suffix extension swallows a following `!?…` run — so the sort+dedup below
     // is still required on both paths.
     if linebreaks.is_empty() {
+        if active.is_empty() {
+            return ByteBoundaries::WholeText;
+        }
         let mut ends: Vec<usize> = Vec::with_capacity(active.len() + 1);
         ends.extend(active.iter().map(|c| c.end as usize));
         ends.push(len);
         ends.sort_unstable();
         ends.dedup();
-        return ends;
+        return ByteBoundaries::Multiple(ends);
     }
 
     let active = apply_linebreak_force_bounds(active, &linebreaks);
@@ -1244,7 +1261,7 @@ pub fn sentence_byte_boundaries(text: &str) -> Vec<usize> {
     ends.push(len);
     ends.sort_unstable();
     ends.dedup();
-    ends
+    ByteBoundaries::Multiple(ends)
 }
 
 #[inline]
@@ -1320,11 +1337,63 @@ fn prev_char_start(bytes: &[u8], b: usize) -> usize {
     p
 }
 
-/// Sentinel for `prev` after a skipped kana/kanji run. Any char outside
+/// Sentinel for `prev` after a skipped boring run. Any char outside
 /// the trigger/whitespace/emoji classes works: every per-position start-check
-/// only tests membership in those classes, so a CJK char and this sentinel are
+/// only tests membership in those classes, so a boring char and this sentinel are
 /// indistinguishable to each of them (guarded by the differential suite).
-const KANA_SENTINEL: char = 'あ';
+const BORING_SENTINEL: char = 'a';
+
+/// Standard SWAR zero-byte test: true when any byte lane in `word` is zero.
+#[inline]
+fn has_zero_byte(word: u64) -> bool {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    word.wrapping_sub(LO) & !word & HI != 0
+}
+
+#[inline]
+fn is_boring_ascii(byte: u8) -> bool {
+    byte.is_ascii() && byte > b' ' && !matches!(byte, b'!' | b'(' | b'.' | b'?')
+}
+
+/// Advance over printable ASCII that cannot trigger any scanner rule.
+///
+/// Eight bytes are accepted at once when every lane is printable ASCII and no
+/// lane equals one of the four ASCII trigger bytes. Treating all controls up to
+/// space as stops is deliberately conservative: only ASCII whitespace is
+/// semantically interesting, but the broader stop set makes the packed range
+/// check cheap and cannot skip a trigger.
+fn ascii_skip_run(bytes: &[u8], mut b: usize, len: usize) -> usize {
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const REP_21: u64 = 0x2121_2121_2121_2121;
+    const REP_BANG: u64 = 0x2121_2121_2121_2121;
+    const REP_OPEN: u64 = 0x2828_2828_2828_2828;
+    const REP_DOT: u64 = 0x2E2E_2E2E_2E2E_2E2E;
+    const REP_QUESTION: u64 = 0x3F3F_3F3F_3F3F_3F3F;
+
+    while b + 8 <= len {
+        let word = read_u64_unaligned(bytes, b);
+        if word & HI != 0 {
+            break;
+        }
+        // Setting every lane's high bit prevents cross-lane borrows. After
+        // subtracting 0x21, the high bit remains set iff the byte was >= 0x21.
+        let printable = (word | HI).wrapping_sub(REP_21) & HI;
+        if printable != HI
+            || has_zero_byte(word ^ REP_BANG)
+            || has_zero_byte(word ^ REP_OPEN)
+            || has_zero_byte(word ^ REP_DOT)
+            || has_zero_byte(word ^ REP_QUESTION)
+        {
+            break;
+        }
+        b += 8;
+    }
+    while b < len && is_boring_ascii(bytes[b]) {
+        b += 1;
+    }
+    b
+}
 
 /// Byte-pattern predicate: is the UTF-8 scalar starting at `b` a "pure
 /// kana/kanji" codepoint that can NEVER be a scanner trigger (basic punct /
@@ -1466,19 +1535,23 @@ fn scan_bounds_bytes(text: &str, active: &mut Vec<Bound>, linebreaks: &mut Vec<(
     // in `EMOJI_DATA`, so `is_emoji` is exactly that predicate for every `ch`.
     let mut prev_is_emoji = false;
     while b < len {
-        // Bulk-skip runs of pure kana/kanji bytes — the dominant case for
-        // Japanese prose. These codepoints can never be a trigger, whitespace
-        // or emoji (byte-pattern proof in `cjk_skip_ok`), so we advance past
-        // them without decoding each scalar or dispatching per char. This is a
-        // large saving over the old loop, which decoded and classified every
-        // character individually.
-        let run_end = cjk_skip_run(bytes, b, len);
+        // Bulk-skip printable ASCII and pure kana/kanji runs that cannot be a
+        // trigger, whitespace or emoji. Dispatching on the first byte avoids
+        // paying the CJK SWAR setup on ASCII and vice versa.
+        let first = bytes[b];
+        let run_end = if is_boring_ascii(first) {
+            ascii_skip_run(bytes, b, len)
+        } else if first.is_ascii() {
+            b
+        } else {
+            cjk_skip_run(bytes, b, len)
+        };
         if run_end != b {
             debug_assert!(cjk_run_is_boring(bytes, b, run_end));
             // All skipped chars are non-trigger / non-ws / non-emoji, so the
             // sentinel below reproduces the per-position "prev" start-checks
-            // exactly (a real CJK char would pass the same checks).
-            prev = Some(KANA_SENTINEL);
+            // exactly (any real boring char would pass the same checks).
+            prev = Some(BORING_SENTINEL);
             prev_is_emoji = false;
             b = run_end;
             continue;
@@ -2024,9 +2097,18 @@ pub fn split_sentences(text: &str) -> Vec<&str> {
 }
 
 fn split_sentences_impl(text: &str) -> Vec<&str> {
-    // `sentence_byte_boundaries` returns byte offsets (always char-aligned), so
-    // the sentences are plain slices — no char-index→byte translation pass.
-    let boundaries = sentence_byte_boundaries(text);
+    // Avoid allocating a boundary vector for the overwhelmingly common case
+    // where the entire non-empty input is one sentence.
+    let boundaries = match compute_byte_boundaries(text) {
+        ByteBoundaries::WholeText => {
+            return if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![text]
+            };
+        }
+        ByteBoundaries::Multiple(boundaries) => boundaries,
+    };
 
     let mut out = Vec::with_capacity(boundaries.len() + 1);
     let mut start = 0usize;
@@ -2146,8 +2228,9 @@ mod tests {
 
     #[test]
     fn byte_skip_boundary_safety() {
-        // `scan_bounds_bytes` bulk-advances past runs of pure kana/kanji bytes
-        // (see `cjk_skip_run`). The byte ranges it skips are provably disjoint
+        // `scan_bounds_bytes` bulk-advances past boring ASCII and runs of pure
+        // kana/kanji bytes (see `ascii_skip_run` and `cjk_skip_run`). The byte
+        // ranges it skips are provably disjoint
         // from every trigger/whitespace/emoji codepoint, but that proof rests
         // on excluding the *exact* dangerous patterns: 。/　 (E3 80),
         // ！？． (EF BC), the E3 8A emoji ⚗ U+3297 / ⚙ U+3299, and ASCII
@@ -2191,6 +2274,11 @@ mod tests {
         cases.push("⚗漢字⚙かな😀です。".into());
         cases.push("漢字⚗⚙かな😀です。".into());
         cases.push("かな⚗漢字⚙かな😀です？".into());
+        for danger in ["!", "(", ".", "?", " ", "\t", "\n", "😀", "。"] {
+            cases.push(format!("abcdefgh{danger}ijklmnop"));
+            cases.push(format!("01234567{danger}89ABCDEF"));
+        }
+        cases.push("abcdefghijklmnopqrstuvwxyz0123456789".into());
         for text in &cases {
             let via_bounds = sentence_byte_boundaries(text);
             let via_pipeline = segment_impl(text).final_boundaries;
@@ -2211,6 +2299,38 @@ mod tests {
                 "byte-skip diverged on {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn ascii_skip_stops_at_every_trigger_class() {
+        assert_eq!(ascii_skip_run(b"abcdefghABCDEFGH", 0, 16), 16);
+        for input in [
+            b"abcdefg!tail".as_slice(),
+            b"abcdefg(tail",
+            b"abcdefg.tail",
+            b"abcdefg?tail",
+            b"abcdefg tail",
+            b"abcdefg\ttail",
+        ] {
+            assert_eq!(ascii_skip_run(input, 0, input.len()), 7, "{input:?}");
+        }
+        let utf8 = "abcdefg가".as_bytes();
+        assert_eq!(ascii_skip_run(utf8, 0, utf8.len()), 7);
+    }
+
+    #[test]
+    fn boundary_fast_path_marks_effective_single_sentences() {
+        assert!(matches!(
+            compute_byte_boundaries("plain ASCII without a terminator"),
+            ByteBoundaries::WholeText
+        ));
+        assert!(matches!(
+            compute_byte_boundaries("小数は3.5です"),
+            ByteBoundaries::WholeText
+        ));
+        assert_eq!(sentence_byte_boundaries("plain"), vec![5]);
+        assert_eq!(split_sentences("plain"), vec!["plain"]);
+        assert!(split_sentences("").is_empty());
     }
 
     #[test]
