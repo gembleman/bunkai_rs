@@ -274,7 +274,9 @@ fn test_setup_sentence_variations() {
 
 #[test]
 fn test_live_reference_corpus() {
-    // Sentences verified against the Python reference (BunkaiSentenceBoundaryDisambiguation).
+    // Sentences follow the Python reference plus this crate's closing-mark
+    // rule: a quote/bracket immediately after a boundary stays with the
+    // preceding sentence.
     let cases: &[(&str, Vec<&str>)] = &[
         ("うーん🤔🤔🤔どうしよう", vec!["うーん🤔🤔🤔", "どうしよう"]),
         (
@@ -291,7 +293,7 @@ fn test_live_reference_corpus() {
         ("彼は来る？と聞いた。", vec!["彼は来る？と聞いた。"]),
         (
             "「です。ます。」形式の文。",
-            vec!["「です。", "ます。", "」形式の文。"],
+            vec!["「です。", "ます。」", "形式の文。"],
         ),
         (
             "感情(汗)が止まらない。次(泣)に進む。",

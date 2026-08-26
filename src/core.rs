@@ -906,7 +906,8 @@ pub(crate) fn segment_impl(text: &str) -> PipelineOutput<'_> {
     prof::end();
 
     prof::begin("into_output");
-    let out = state.into_output();
+    let mut out = state.into_output();
+    attach_sentence_closers_chars(&view.chars, &mut out.final_boundaries);
     prof::end();
     prof::on_impl_done(prof_base);
     out
@@ -1249,6 +1250,7 @@ fn compute_byte_boundaries(text: &str) -> ByteBoundaries {
         let mut ends: Vec<usize> = Vec::with_capacity(active.len() + 1);
         ends.extend(active.iter().map(|c| c.end as usize));
         ends.push(len);
+        attach_sentence_closers_bytes(text, &mut ends);
         ends.sort_unstable();
         ends.dedup();
         return ByteBoundaries::Multiple(ends);
@@ -1259,6 +1261,7 @@ fn compute_byte_boundaries(text: &str) -> ByteBoundaries {
     // (cheap, rare) sort+dedup is still required on this path.
     let mut ends: Vec<usize> = active.iter().map(|c| c.end as usize).collect();
     ends.push(len);
+    attach_sentence_closers_bytes(text, &mut ends);
     ends.sort_unstable();
     ends.dedup();
     ByteBoundaries::Multiple(ends)
@@ -1267,6 +1270,28 @@ fn compute_byte_boundaries(text: &str) -> ByteBoundaries {
 #[inline]
 fn assert_offset_capacity(text: &str) {
     u32::try_from(text.len()).expect("bunkai_rs inputs must not exceed u32::MAX bytes");
+}
+
+fn attach_sentence_closers_bytes(text: &str, boundaries: &mut [usize]) {
+    for end in boundaries.iter_mut() {
+        while *end < text.len() {
+            let closer = text[*end..].chars().next().expect("end is in bounds");
+            if !is_sentence_closer(closer) {
+                break;
+            }
+            *end += closer.len_utf8();
+        }
+    }
+}
+
+fn attach_sentence_closers_chars(chars: &[char], boundaries: &mut Vec<usize>) {
+    for end in boundaries.iter_mut() {
+        while *end < chars.len() && is_sentence_closer(chars[*end]) {
+            *end += 1;
+        }
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
 }
 
 /// Infallible decoding of the scalar value at byte offset `b` of a valid UTF-8
@@ -2112,10 +2137,10 @@ fn split_sentences_impl(text: &str) -> Vec<&str> {
 
     let mut out = Vec::with_capacity(boundaries.len() + 1);
     let mut start = 0usize;
-    for &b in &boundaries {
-        if b > start {
-            out.push(&text[start..b]);
-            start = b;
+    for &end in &boundaries {
+        if end > start {
+            out.push(&text[start..end]);
+            start = end;
         }
     }
     // A final boundary equal to the byte length leaves the last sentence here.
@@ -2123,6 +2148,34 @@ fn split_sentences_impl(text: &str) -> Vec<&str> {
         out.push(&text[start..]);
     }
     out
+}
+
+/// Closing punctuation that belongs to a sentence-ending quote/bracket rather
+/// than forming a useful sentence on its own. Both Japanese/full-width and
+/// common ASCII/typographic forms are included; consecutive closers are folded
+/// together (`。』）」`).
+#[inline]
+fn is_sentence_closer(c: char) -> bool {
+    matches!(
+        c,
+        ')' | ']'
+            | '}'
+            | '）'
+            | '］'
+            | '｝'
+            | '〉'
+            | '》'
+            | '」'
+            | '』'
+            | '】'
+            | '〕'
+            | '〗'
+            | '〙'
+            | '〟'
+            | '’'
+            | '”'
+            | '｠'
+    )
 }
 
 #[cfg(test)]
@@ -2148,6 +2201,19 @@ mod tests {
             };
             assert_eq!(emoji_lookup(codepoint), expected, "U+{codepoint:04X}");
         }
+    }
+
+    #[test]
+    fn closing_quote_stays_with_preceding_sentence() {
+        let quoted = "「そうです。」";
+        assert_eq!(segment(quoted).final_boundaries, vec![7]);
+        assert_eq!(sentence_byte_boundaries(quoted), vec![quoted.len()]);
+        assert_eq!(split_sentences(quoted), vec![quoted]);
+
+        assert_eq!(
+            split_sentences("『終わり！』次です。"),
+            vec!["『終わり！』", "次です。"]
+        );
     }
 
     #[test]
@@ -2480,19 +2546,19 @@ mod tests {
             // at the pipeline boundaries — lossless, contiguous, and every hard
             // cut aligned with the next boundary offset.
             let sentences = split_sentences(text);
-            let mut cum_chars = 0usize;
+            let mut cum_bytes = 0usize;
             for (k, s) in sentences.iter().enumerate() {
-                cum_chars += s.chars().count();
+                cum_bytes += s.len();
                 if k + 1 < sentences.len() {
                     assert_eq!(
-                        cum_chars, via_layers[k],
+                        cum_bytes, via_bounds[k],
                         "split_sentences cut misaligned at case #{i}: {text:?}"
                     );
                 }
             }
             assert_eq!(
-                cum_chars,
-                text.chars().count(),
+                cum_bytes,
+                text.len(),
                 "split_sentences lost/duplicated chars at case #{i}: {text:?}"
             );
         }
