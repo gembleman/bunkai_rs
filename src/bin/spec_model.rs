@@ -317,7 +317,8 @@ fn emoji_runs(chars: &[char]) -> Vec<Span> {
     let n = chars.len();
     let mut out = Vec::new();
     for i in 0..n {
-        if emoji_entry(chars[i]).is_none() || !is_run_start(chars, i, |c| emoji_entry(c).is_some()) {
+        if emoji_entry(chars[i]).is_none() || !is_run_start(chars, i, |c| emoji_entry(c).is_some())
+        {
             continue;
         }
         let j = run_end(chars, i, |c| emoji_entry(c).is_some());
@@ -518,9 +519,41 @@ pub(crate) fn spec_boundaries(text: &str) -> Vec<usize> {
     }));
 
     let mut bounds: Vec<usize> = final_spans.iter().map(|s| s.r).collect();
+    attach_sentence_closers(&chars, &mut bounds);
     bounds.sort_unstable();
     bounds.dedup();
     bounds
+}
+
+fn is_sentence_closer(c: char) -> bool {
+    matches!(
+        c,
+        ')' | ']'
+            | '}'
+            | '）'
+            | '］'
+            | '｝'
+            | '〉'
+            | '》'
+            | '」'
+            | '』'
+            | '】'
+            | '〕'
+            | '〗'
+            | '〙'
+            | '〟'
+            | '’'
+            | '”'
+            | '｠'
+    )
+}
+
+fn attach_sentence_closers(chars: &[char], boundaries: &mut [usize]) {
+    for end in boundaries {
+        while *end < chars.len() && is_sentence_closer(chars[*end]) {
+            *end += 1;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -535,9 +568,7 @@ pub(crate) fn spec_boundaries(text: &str) -> Vec<usize> {
 use std::collections::HashSet;
 use std::process::exit;
 
-use bunkai_rs::{
-    segment, sentence_byte_boundaries, split_sentences,
-};
+use bunkai_rs::{segment, sentence_byte_boundaries, split_sentences};
 
 // ---- corpora ---------------------------------------------------------------
 
@@ -861,8 +892,15 @@ fn check_golden() -> Result<(), String> {
         return Err(format!("golden case count drifted: {}", cases.len()));
     }
     for (text, expected) in &cases {
-        if &spec_boundaries(text) != expected {
-            return Err(format!("spec vs golden diverged on {text:?} (expected {expected:?})"));
+        let chars: Vec<char> = text.chars().collect();
+        let mut expected = expected.clone();
+        attach_sentence_closers(&chars, &mut expected);
+        expected.sort_unstable();
+        expected.dedup();
+        if spec_boundaries(text) != expected {
+            return Err(format!(
+                "spec vs golden diverged on {text:?} (expected {expected:?})"
+            ));
         }
     }
     Ok(())
@@ -875,7 +913,12 @@ fn check_differential() -> Result<(), String> {
         return Err(format!("differential case count drifted: {}", cases.len()));
     }
     for (text, expected) in &cases {
-        if &spec_boundaries(text) != expected {
+        let chars: Vec<char> = text.chars().collect();
+        let mut expected = expected.clone();
+        attach_sentence_closers(&chars, &mut expected);
+        expected.sort_unstable();
+        expected.dedup();
+        if spec_boundaries(text) != expected {
             return Err(format!(
                 "spec vs differential diverged on {text:?} (expected {expected:?})"
             ));
@@ -1019,10 +1062,12 @@ fn check_lemma2() -> Result<(), String> {
                 formula.push(b);
             }
         }
+        attach_sentence_closers(&chars, &mut formula);
         formula.sort_unstable();
         formula.dedup();
 
         let mut sim2 = sim;
+        attach_sentence_closers(&chars, &mut sim2);
         sim2.sort_unstable();
         sim2.dedup();
         if sim2 != formula {

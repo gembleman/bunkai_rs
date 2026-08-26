@@ -890,7 +890,8 @@ pub(crate) fn segment_impl(text: &str) -> PipelineOutput<'_> {
     prof::end();
 
     prof::begin("into_output");
-    let out = state.into_output();
+    let mut out = state.into_output();
+    attach_sentence_closers_chars(&view.chars, &mut out.final_boundaries);
     prof::end();
     prof::on_impl_done(prof_base);
     out
@@ -904,9 +905,9 @@ fn apply_indirect_quote<'a>(view: &TextView<'a>, state: &mut PipelineState<'a>) 
     // stage) is no longer needed. `retain` only memmoves survivors within the
     // one buffer, dropping the per-record clone the old `Vec::push(span.clone())`
     // did.
-    state.final_spans_mut().retain(|span| {
-        !is_exception_particle(view, span.end as usize)
-    });
+    state
+        .final_spans_mut()
+        .retain(|span| !is_exception_particle(view, span.end as usize));
     debug_assert!(
         state
             .final_spans()
@@ -1191,9 +1192,7 @@ pub fn sentence_byte_boundaries(text: &str) -> Vec<usize> {
         if is_exception_particle_bytes(text, end) {
             return false;
         }
-        if is_exception_numeric_bytes(text, start)
-            || is_exception_mailaddress_bytes(text, start)
-        {
+        if is_exception_numeric_bytes(text, start) || is_exception_mailaddress_bytes(text, start) {
             return false;
         }
         // A span whose whole matched text is "." / "．" iff it spans exactly
@@ -1215,23 +1214,44 @@ pub fn sentence_byte_boundaries(text: &str) -> Vec<usize> {
     // spans from different rules can overlap — e.g. a kaomoji whose trailing
     // suffix extension swallows a following `!?…` run — so the sort+dedup below
     // is still required on both paths.
-    if linebreaks.is_empty() {
+    let mut ends = if linebreaks.is_empty() {
         let mut ends: Vec<usize> = Vec::with_capacity(active.len() + 1);
         ends.extend(active.iter().map(|c| c.end as usize));
         ends.push(len);
-        ends.sort_unstable();
-        ends.dedup();
-        return ends;
-    }
-
-    let active = apply_linebreak_force_bounds(active, &linebreaks);
-    // The merge may place a duplicate end next to a leftover linebreak, so the
-    // (cheap, rare) sort+dedup is still required on this path.
-    let mut ends: Vec<usize> = active.iter().map(|c| c.end as usize).collect();
-    ends.push(len);
+        ends
+    } else {
+        let active = apply_linebreak_force_bounds(active, &linebreaks);
+        // The merge may place a duplicate end next to a leftover linebreak.
+        let mut ends: Vec<usize> = active.iter().map(|c| c.end as usize).collect();
+        ends.push(len);
+        ends
+    };
+    attach_sentence_closers_bytes(text, &mut ends);
     ends.sort_unstable();
     ends.dedup();
     ends
+}
+
+fn attach_sentence_closers_bytes(text: &str, boundaries: &mut [usize]) {
+    for end in boundaries.iter_mut() {
+        while *end < text.len() {
+            let closer = text[*end..].chars().next().expect("end is in bounds");
+            if !is_sentence_closer(closer) {
+                break;
+            }
+            *end += closer.len_utf8();
+        }
+    }
+}
+
+fn attach_sentence_closers_chars(chars: &[char], boundaries: &mut Vec<usize>) {
+    for end in boundaries.iter_mut() {
+        while *end < chars.len() && is_sentence_closer(chars[*end]) {
+            *end += 1;
+        }
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
 }
 
 /// Infallible decoding of the scalar value at byte offset `b` of a valid UTF-8
@@ -1543,12 +1563,7 @@ fn scan_basic_run_bytes(bytes: &[u8], len: usize, start: usize, active: &mut Vec
 }
 
 /// A maximal run of `…★☆♪` plus (if present) exactly one following punctuator.
-fn scan_emotion_symbol_run_bytes(
-    bytes: &[u8],
-    len: usize,
-    start: usize,
-    active: &mut Vec<Bound>,
-) {
+fn scan_emotion_symbol_run_bytes(bytes: &[u8], len: usize, start: usize, active: &mut Vec<Bound>) {
     let mut j = start;
     while j < len {
         let (c, n) = char_at_byte(bytes, j);
@@ -1680,9 +1695,7 @@ fn is_exception_particle_bytes(text: &str, end: usize) -> bool {
         return false;
     }
     let mut idx = end;
-    while idx < len
-        && char_at_byte_opt(bytes, idx).is_some_and(|(c, _)| c == '\n')
-        && idx + 1 < len
+    while idx < len && char_at_byte_opt(bytes, idx).is_some_and(|(c, _)| c == '\n') && idx + 1 < len
     {
         idx += 1;
     }
@@ -1792,10 +1805,7 @@ fn is_exception_no_parts_bytes(text: &str, start: usize, end: usize, is_dot: boo
     next_char.is_ascii_digit()
 }
 
-fn apply_linebreak_force_bounds(
-    active: Vec<Bound>,
-    linebreaks: &[(usize, usize)],
-) -> Vec<Bound> {
+fn apply_linebreak_force_bounds(active: Vec<Bound>, linebreaks: &[(usize, usize)]) -> Vec<Bound> {
     // A HashMap is overkill here: `linebreaks` already arrives from the scanner
     // sorted by ascending start with unique starts, so each bound's end is
     // looked up against the linebreak starts with a binary search — no hashing
@@ -2013,16 +2023,16 @@ pub fn split_sentences(text: &str) -> Vec<&str> {
 }
 
 fn split_sentences_impl(text: &str) -> Vec<&str> {
-    // `sentence_byte_boundaries` returns byte offsets (always char-aligned), so
-    // the sentences are plain slices — no char-index→byte translation pass.
+    // `sentence_byte_boundaries` returns byte offsets (always char-aligned), so the
+    // sentences are plain slices — no char-index→byte translation pass.
     let boundaries = sentence_byte_boundaries(text);
 
     let mut out = Vec::with_capacity(boundaries.len() + 1);
     let mut start = 0usize;
-    for &b in &boundaries {
-        if b > start {
-            out.push(&text[start..b]);
-            start = b;
+    for &end in &boundaries {
+        if end > start {
+            out.push(&text[start..end]);
+            start = end;
         }
     }
     // A final boundary equal to the byte length leaves the last sentence here.
@@ -2032,9 +2042,50 @@ fn split_sentences_impl(text: &str) -> Vec<&str> {
     out
 }
 
+/// Closing punctuation that belongs to a sentence-ending quote/bracket rather
+/// than forming a useful sentence on its own. Both Japanese/full-width and
+/// common ASCII/typographic forms are included; consecutive closers are folded
+/// together (`。』）」`).
+#[inline]
+fn is_sentence_closer(c: char) -> bool {
+    matches!(
+        c,
+        ')' | ']'
+            | '}'
+            | '）'
+            | '］'
+            | '｝'
+            | '〉'
+            | '》'
+            | '」'
+            | '』'
+            | '】'
+            | '〕'
+            | '〗'
+            | '〙'
+            | '〟'
+            | '’'
+            | '”'
+            | '｠'
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_quote_stays_with_preceding_sentence() {
+        let quoted = "「そうです。」";
+        assert_eq!(segment(quoted).final_boundaries, vec![7]);
+        assert_eq!(sentence_byte_boundaries(quoted), vec![quoted.len()]);
+        assert_eq!(split_sentences(quoted), vec![quoted]);
+
+        assert_eq!(
+            split_sentences("『終わり！』次です。"),
+            vec!["『終わり！』", "次です。"]
+        );
+    }
 
     #[test]
     fn face_mark_detection_matches_reference() {
@@ -2174,7 +2225,10 @@ mod tests {
                 debug_assert_eq!(via_pipeline[bi], text.chars().count());
                 via_pipeline_bytes.push(text.len());
             }
-            assert_eq!(via_bounds, via_pipeline_bytes, "byte-skip diverged on {text:?}");
+            assert_eq!(
+                via_bounds, via_pipeline_bytes,
+                "byte-skip diverged on {text:?}"
+            );
         }
     }
 
@@ -2325,19 +2379,19 @@ mod tests {
             // at the pipeline boundaries — lossless, contiguous, and every hard
             // cut aligned with the next boundary offset.
             let sentences = split_sentences(text);
-            let mut cum_chars = 0usize;
+            let mut cum_bytes = 0usize;
             for (k, s) in sentences.iter().enumerate() {
-                cum_chars += s.chars().count();
+                cum_bytes += s.len();
                 if k + 1 < sentences.len() {
                     assert_eq!(
-                        cum_chars, via_layers[k],
+                        cum_bytes, via_bounds[k],
                         "split_sentences cut misaligned at case #{i}: {text:?}"
                     );
                 }
             }
             assert_eq!(
-                cum_chars,
-                text.chars().count(),
+                cum_bytes,
+                text.len(),
                 "split_sentences lost/duplicated chars at case #{i}: {text:?}"
             );
         }

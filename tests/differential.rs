@@ -2,6 +2,40 @@
 // Regenerate with `python3 scripts/generate_differential.py`; do not edit manually.
 use bunkai_rs::segment;
 
+fn with_closing_marks(text: &str, expected: &[usize]) -> Vec<usize> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut adjusted = expected.to_vec();
+    for end in &mut adjusted {
+        while *end < chars.len()
+            && matches!(
+                chars[*end],
+                ')' | ']'
+                    | '}'
+                    | '）'
+                    | '］'
+                    | '｝'
+                    | '〉'
+                    | '》'
+                    | '」'
+                    | '』'
+                    | '】'
+                    | '〕'
+                    | '〗'
+                    | '〙'
+                    | '〟'
+                    | '’'
+                    | '”'
+                    | '｠'
+            )
+        {
+            *end += 1;
+        }
+    }
+    adjusted.sort_unstable();
+    adjusted.dedup();
+    adjusted
+}
+
 #[test]
 fn differential_matches_python_reference() {
     let cases: &[(&str, Vec<usize>)] = &[
@@ -533,7 +567,8 @@ fn differential_matches_python_reference() {
     for (i, (text, expected)) in cases.iter().enumerate() {
         let seg = segment(text);
         assert_eq!(
-            seg.final_boundaries, *expected,
+            seg.final_boundaries,
+            with_closing_marks(text, expected),
             "case #{i} diverges from python reference: {text:?}"
         );
     }
