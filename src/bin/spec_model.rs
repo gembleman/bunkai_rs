@@ -8,7 +8,8 @@
 //! either direction is caught by the comparison tests. The only shared input
 //! is the emoji *data* table (data, not algorithm).
 //!
-//! Compiled only under `cfg(test)`; never part of the public API. See
+//! A standalone verification binary (`cargo run --bin spec_model`); never part of the
+//! public API. `tests/spec_model_cli.rs` runs it as a process. See
 //! `docs/spec.md` §8 for how the verification uses it.
 
 use std::collections::HashMap;
@@ -562,7 +563,7 @@ fn attach_sentence_closers(chars: &[char], boundaries: &mut [usize]) {
 //
 // This file is also a standalone binary:
 //   cargo run  --bin spec_model   — exits non-zero on any divergence
-//   cargo test --bin spec_model   — the granular #[test]s below
+//   cargo test --test spec_model_cli — runs the binary and asserts every check passes
 // ---------------------------------------------------------------------------
 
 use std::collections::HashSet;
@@ -1132,35 +1133,5 @@ fn main() {
     } else {
         eprintln!("{failed} check(s) failed");
         exit(1);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn t4_generated() {
-        check_generated().expect("T4 generated corpus");
-    }
-    #[test]
-    fn t5_golden() {
-        check_golden().expect("T5 golden corpus");
-    }
-    #[test]
-    fn t5_differential() {
-        check_differential().expect("T5 differential corpus");
-    }
-    #[test]
-    fn t1_wellformedness() {
-        check_wellformedness().expect("T1 well-formedness");
-    }
-    #[test]
-    fn t6_first_wins() {
-        check_first_wins().expect("T6 first-wins + Lemma 1");
-    }
-    #[test]
-    fn lemma2_linebreak() {
-        check_lemma2().expect("Lemma 2 linebreak formula");
     }
 }
