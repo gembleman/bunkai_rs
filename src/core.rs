@@ -1481,20 +1481,28 @@ fn read_u64_unaligned(bytes: &[u8], b: usize) -> u64 {
 /// window stays lead-aligned). A scalar tail finishes any remaining partial
 /// window. No `unsafe` and no target-feature intrinsics (stable-only crate).
 fn cjk_skip_run(bytes: &[u8], mut b: usize, len: usize) -> usize {
-    const REP_E4: u64 = 0xE4E4E4E4E4E4E4E4;
-    const REP_E9: u64 = 0xE9E9E9E9E9E9E9E9;
+    const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
     const REP_E3: u64 = 0xE3E3E3E3E3E3E3E3;
-    const REP_81: u64 = 0x8181818181818181;
-    const REP_83: u64 = 0x8383838383838383;
     const TOP: u64 = 0x8080_8080_8080_8080;
+    // Carry-free exact byte tests: operate on the low 7 bits only, so no sum
+    // ever exceeds 0xFE and nothing propagates between byte lanes.
+    #[inline(always)]
+    fn ge(y: u64, k: u64) -> u64 {
+        // lane high bit set iff the lane's low7 value is >= k (k in 1..=0x7F).
+        y.wrapping_add((0x80 - k) * 0x0101_0101_0101_0101)
+    }
     while b + 8 <= len {
         let w = read_u64_unaligned(bytes, b);
-        // skippable-lead mask: (byte ∈ [0xE4,0xE9]) OR
-        // (byte == 0xE3 AND next byte ∈ [0x81,0x83]).
-        let e4e9 = !(w.wrapping_sub(REP_E4) | REP_E9.wrapping_sub(w)) & TOP;
-        let e3 = !(w ^ REP_E3) & TOP;
-        let next = w >> 8; // byte_{k+1} aligned to position k
-        let next_ok = !(next.wrapping_sub(REP_81) | REP_83.wrapping_sub(next)) & TOP;
+        let y = w & LOW7;
+        // byte in [0xE4,0xE9]: top bit set and low7 in [0x64,0x69].
+        let e4e9 = w & ge(y, 0x64) & !ge(y, 0x6A) & TOP;
+        // byte == 0xE3 exactly (zero-byte test on w ^ 0xE3..).
+        let x = w ^ REP_E3;
+        let e3 = !(((x & LOW7).wrapping_add(LOW7)) | x) & TOP;
+        // next byte in [0x81,0x83]: top bit set and low7 in [1,3].
+        let next = w >> 8;
+        let ny = next & LOW7;
+        let next_ok = next & ge(ny, 1) & !ge(ny, 4) & TOP;
         let lead = e4e9 | (e3 & next_ok);
         // lead bits at byte offsets 0 / 3 / 6.
         let s0 = (lead & 0x0000_0000_0000_0080) != 0;
