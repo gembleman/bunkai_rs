@@ -1,5 +1,3 @@
-// AUTO-GENERATED differential test against the live Python bunkai reference.
-// Regenerate with `python3 scripts/generate_differential.py`; do not edit manually.
 use bunkai_rs::segment;
 
 fn with_closing_marks(text: &str, expected: &[usize]) -> Vec<usize> {

@@ -1,20 +1,4 @@
 #!/usr/bin/env python3
-"""Regenerate `tests/differential.rs`.
-
-Runs the live Python `bunkai` reference on a corpus and records each string's
-`final_boundaries` (char offsets) as a Rust integration test. This keeps the
-Rust port honest against the upstream implementation.
-
-Setup
------
-    uv venv refenv --python 3.10
-    VIRTUAL_ENV=refenv uv pip install dataclasses-json janome spans emoji emojis more_itertools toml tqdm
-    git clone --depth 1 https://github.com/megagonlabs/bunkai /tmp/bunkai_ref
-
-Usage
------
-    VIRTUAL_ENV=refenv python scripts/generate_differential.py
-"""
 from __future__ import annotations
 
 import json
@@ -26,19 +10,12 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 REF = Path(os.environ.get("BUNKAI_REF", "/tmp/bunkai_ref"))
 
-# Inputs where the Rust port intentionally diverges from the Janome-based
-# reference, so they must not be machine-compared. Each entry names the corpus
-# generator tag that produces it; see build() below for the exact text.
 KNOWN_DIVERGENT_TEXTS = {
-    # Janome tokenises と + う as the single token とう, so the reference does NOT
-    # apply the ["と"] indirect-quote exception here, while the dependency-free
-    # string matcher in this port does. (See README, "Trade-offs".)
     "え?とういう質問。",
 }
 
 
 def build() -> list[str]:
-    """Systematic corpus of Japanese sentence-boundary inputs."""
     out = []
     ref = [
         "これが１文目です。。。。そして、これが２文目…３文目。",
@@ -145,7 +122,6 @@ def build() -> list[str]:
 
 
 def reference_eos(corpus: list[str]) -> list[list[int]]:
-    """Compute `find_eos` for every corpus string using the live reference."""
     code = f"""
 import json, sys
 sys.path.insert(0, {str(REF)!r})
@@ -172,8 +148,6 @@ def main() -> None:
     assert len(corpus) == len(eos)
 
     lines = [
-        "// AUTO-GENERATED differential test against the live Python bunkai reference.",
-        "// Regenerate with `python3 scripts/generate_differential.py`; do not edit manually.",
         "use bunkai_rs::segment;",
         "",
         "#[test]",

@@ -1,32 +1,12 @@
-//! Executable transcription of `docs/spec.md` — the formal specification of
-//! the bunkai_rs sentence-boundary algorithm.
-//!
-//! This module is a deliberately **naive, formula-faithful model**: plain set
-//! comprehensions and maximal-run scans over a `Vec<char>`, exactly as the
-//! math defines them. It shares no code with `core.rs` — character classes,
-//! word lists and rule tables are restated from the spec so a divergence in
-//! either direction is caught by the comparison tests. The only shared input
-//! is the emoji *data* table (data, not algorithm).
-//!
-//! A standalone verification binary (`cargo run --bin spec_model`); never part of the
-//! public API. `tests/spec_model_cli.rs` runs it as a process. See
-//! `docs/spec.md` §8 for how the verification uses it.
-
 use std::collections::HashMap;
 
 use bunkai_rs::EMOJI_DATA;
 
-// ---------------------------------------------------------------------------
-// §1 Character classes (spec doc, restated verbatim)
-// ---------------------------------------------------------------------------
-
-/// `B` — basic punctuators.
 #[inline]
 fn is_basic_punct(c: char) -> bool {
     matches!(c, '。' | '!' | '?' | '.' | '！' | '？' | '．')
 }
 
-/// `W` — the 25 Unicode White_Space codepoints.
 #[inline]
 fn is_ws(c: char) -> bool {
     matches!(
@@ -45,25 +25,21 @@ fn is_ws(c: char) -> bool {
     )
 }
 
-/// `S` — emotion symbols.
 #[inline]
 fn is_emotion_symbol(c: char) -> bool {
     matches!(c, '…' | '★' | '☆' | '♪')
 }
 
-/// `P` — emotion punctuation (equals `B`).
 #[inline]
 fn is_emotion_punct(c: char) -> bool {
     is_basic_punct(c)
 }
 
-/// `Ω` — emotion words, in the spec's list order.
 const EMOTION_WORDS: &[&str] = &[
     "笑", "泣", "汗", "涙", "怒", "嬉", "爆", "驚", "喜", "悲", "謎", "恥", "焦", "苦", "照", "憂",
     "笑い", "わら", "泣き", "怒り", "照れ",
 ];
 
-/// `Γ` — face-symbol ranges.
 fn in_face_ranges(c: char) -> bool {
     matches!(
         c,
@@ -73,19 +49,16 @@ fn in_face_ranges(c: char) -> bool {
     )
 }
 
-/// `Γ_ps` — face-symbol chars allowed as prefix/suffix.
 #[inline]
 fn is_face_prefix_suffix(c: char) -> bool {
     !matches!(c, '(' | ')' | '（' | '）') && (in_face_ranges(c) || matches!(c, '\u{4E00}' | '艸'))
 }
 
-/// `Γ₂` — equals `Γ_ps`.
 #[inline]
 fn is_face_symbol2(c: char) -> bool {
     is_face_prefix_suffix(c)
 }
 
-/// `Γ₁` — face-symbol body chars.
 #[inline]
 fn is_face_symbol1(c: char) -> bool {
     c.is_ascii_alphanumeric() || is_fullwidth_alnum(c) || is_face_symbol2(c)
@@ -96,7 +69,6 @@ fn is_fullwidth_alnum(c: char) -> bool {
     matches!(c, '０'..='９' | 'Ａ'..='Ｚ' | 'ａ'..='ｚ')
 }
 
-/// `N` — numeric chars.
 #[inline]
 fn is_numeric_char(c: char) -> bool {
     matches!(
@@ -109,13 +81,11 @@ fn is_numeric_char(c: char) -> bool {
     )
 }
 
-/// `M` — mail chars.
 #[inline]
 fn is_mail_char(c: char) -> bool {
     c.is_ascii_alphanumeric()
 }
 
-/// `N₀` / `O₀` — the letters of "No".
 #[inline]
 fn is_no_n(c: char) -> bool {
     matches!(c, 'N' | 'n' | 'Ｎ' | 'ｎ')
@@ -126,7 +96,6 @@ fn is_no_o(c: char) -> bool {
     matches!(c, 'O' | 'o' | 'Ｏ' | 'ｏ')
 }
 
-/// `E`/`τ` — emoji membership and category via the sorted data table.
 fn emoji_entry(c: char) -> Option<Option<&'static str>> {
     let cp = c as u32;
     let (mut lo, mut hi) = (0usize, EMOJI_DATA.len());
@@ -145,17 +114,10 @@ fn emoji_entry(c: char) -> Option<Option<&'static str>> {
     }
 }
 
-/// `T` — target emoji categories.
 const TARGET_EMOJI_CATEGORIES: &[&str] = &["Smileys & Emotion", "Symbols"];
 
-// ---------------------------------------------------------------------------
-// §5 Exception-predicate data
-// ---------------------------------------------------------------------------
-
-/// `Σ₁` — first chars of the morpheme rules (fast-reject set, spec §5.1).
 const PARTICLE_FIRST_CHARS: &[char] = &['て', 'の', 'と', 'っ', 'に', 'な', 'く', 'も', 'ほ'];
 
-/// `R` — the morpheme rule list, as sequences of parts.
 const MORPHEME_RULES: &[&[&str]] = &[
     &["て"],
     &["の"],
@@ -170,10 +132,6 @@ const MORPHEME_RULES: &[&[&str]] = &[
     &["も", "あり"],
     &["ほど", "でし"],
 ];
-
-// ---------------------------------------------------------------------------
-// Spans
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
@@ -191,10 +149,6 @@ struct Span {
     r: usize,
     kind: Kind,
 }
-
-// ---------------------------------------------------------------------------
-// §2 Maximal runs
-// ---------------------------------------------------------------------------
 
 fn run_end(chars: &[char], mut i: usize, pred: impl Fn(char) -> bool) -> usize {
     while i < chars.len() && pred(chars[i]) {
@@ -218,11 +172,6 @@ fn chars_starts_with(chars: &[char], start: usize, s: &str) -> bool {
     true
 }
 
-// ---------------------------------------------------------------------------
-// §3 Candidate rules
-// ---------------------------------------------------------------------------
-
-/// §3.1 FaceMark `F(s)`.
 fn face_marks(chars: &[char]) -> Vec<Span> {
     let n = chars.len();
     let mut out = Vec::new();
@@ -230,7 +179,6 @@ fn face_marks(chars: &[char]) -> Vec<Span> {
         if ch != '(' && ch != '（' {
             continue;
         }
-        // Body scan: all chars must be in Γ₁, at least one in Γ₂.
         let mut cur = i + 1;
         let mut has_symbol2 = false;
         while cur < n && is_face_symbol1(chars[cur]) {
@@ -245,12 +193,10 @@ fn face_marks(chars: &[char]) -> Vec<Span> {
         if chars[cur] != ')' && chars[cur] != '）' {
             continue;
         }
-        // Trailing extension over Γ_ps.
         let mut r = cur + 1;
         while r < n && is_face_prefix_suffix(chars[r]) {
             r += 1;
         }
-        // Leading extension over Γ_ps.
         let mut l = i;
         while l > 0 && is_face_prefix_suffix(chars[l - 1]) {
             l -= 1;
@@ -264,7 +210,6 @@ fn face_marks(chars: &[char]) -> Vec<Span> {
     out
 }
 
-/// §3.2 Emotion word `E_w(s)`.
 fn emotion_words(chars: &[char]) -> Vec<Span> {
     let n = chars.len();
     let mut out = Vec::new();
@@ -290,7 +235,6 @@ fn emotion_words(chars: &[char]) -> Vec<Span> {
     out
 }
 
-/// §3.3 Emotion symbol `E_s(s)`.
 fn emotion_symbols(chars: &[char]) -> Vec<Span> {
     let n = chars.len();
     let mut out = Vec::new();
@@ -313,7 +257,6 @@ fn emotion_symbols(chars: &[char]) -> Vec<Span> {
     out
 }
 
-/// §3.4 Emoji `G(s)`.
 fn emoji_runs(chars: &[char]) -> Vec<Span> {
     let n = chars.len();
     let mut out = Vec::new();
@@ -337,7 +280,6 @@ fn emoji_runs(chars: &[char]) -> Vec<Span> {
     out
 }
 
-/// §3.5 Basic `Q(s)`.
 fn basic_runs(chars: &[char]) -> Vec<Span> {
     let n = chars.len();
     let mut out = Vec::new();
@@ -356,7 +298,6 @@ fn basic_runs(chars: &[char]) -> Vec<Span> {
     out
 }
 
-/// §3.6 Linebreak `Λ(s)` — maximal whitespace runs containing a newline.
 fn linebreaks(chars: &[char]) -> Vec<(usize, usize)> {
     let n = chars.len();
     let mut out = Vec::new();
@@ -372,17 +313,11 @@ fn linebreaks(chars: &[char]) -> Vec<(usize, usize)> {
     out
 }
 
-// ---------------------------------------------------------------------------
-// §5 Exception predicates
-// ---------------------------------------------------------------------------
-
-/// §5.1 `ι(b)` — indirect-quote particle after a candidate boundary.
 fn is_exception_particle(chars: &[char], b: usize) -> bool {
     let n = chars.len();
     if b >= n {
         return false;
     }
-    // p(b): skip a run of newlines, capped at n−1.
     let mut p = b;
     while p < n && chars[p] == '\n' && p + 1 < n {
         p += 1;
@@ -408,7 +343,6 @@ fn rule_matches(chars: &[char], mut p: usize, rule: &[&str]) -> bool {
     true
 }
 
-/// §5.2 `δ_num(l)` — dot between two numeric chars.
 fn is_exception_numeric(chars: &[char], l: usize) -> bool {
     let n = chars.len();
     if l == 0 || l + 1 >= n {
@@ -420,7 +354,6 @@ fn is_exception_numeric(chars: &[char], l: usize) -> bool {
     is_numeric_char(chars[l - 1]) && is_numeric_char(chars[l + 1])
 }
 
-/// §5.3 `δ_mail(l)` — dot between two mail chars.
 fn is_exception_mailaddress(chars: &[char], l: usize) -> bool {
     let n = chars.len();
     if l == 0 || l + 1 >= n {
@@ -432,7 +365,6 @@ fn is_exception_mailaddress(chars: &[char], l: usize) -> bool {
     is_mail_char(chars[l - 1]) && is_mail_char(chars[l + 1])
 }
 
-/// §5.4 `ν(l, r)` — "No." followed by a digit.
 fn is_exception_no_parts(chars: &[char], l: usize, r: usize) -> bool {
     let n = chars.len();
     if !(r == l + 1 && (chars[l] == '.' || chars[l] == '．')) {
@@ -444,19 +376,11 @@ fn is_exception_no_parts(chars: &[char], l: usize, r: usize) -> bool {
     is_no_n(chars[l - 2]) && is_no_o(chars[l - 1]) && chars[r].is_ascii_digit()
 }
 
-// ---------------------------------------------------------------------------
-// §6 The pipeline
-// ---------------------------------------------------------------------------
-
-/// The full pipeline of §6 — `B(s)` as char-index boundaries.
 pub(crate) fn spec_boundaries(text: &str) -> Vec<usize> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
     let sentinel_key = if n == 0 { (0, 0) } else { (n - 1, n) };
 
-    // §4 candidate set: rule spans (sentinel-key collisions suppressed, i.e.
-    // sentinel-first priority per Lemma 1) in the implementation's layer
-    // order (fresh rule first, earlier layers appended).
     let mut spans: Vec<Span> = Vec::new();
     for s in basic_runs(&chars) {
         if (s.l, s.r) != sentinel_key {
@@ -468,7 +392,6 @@ pub(crate) fn spec_boundaries(text: &str) -> Vec<usize> {
             spans.push(s);
         }
     }
-    // The emotion layer is unified: sorted by key, first occurrence kept.
     let mut emotion = emotion_words(&chars);
     emotion.extend(emotion_symbols(&chars));
     emotion.sort_by_key(|s| (s.l, s.r));
@@ -489,14 +412,10 @@ pub(crate) fn spec_boundaries(text: &str) -> Vec<usize> {
         kind: Kind::Sentinel,
     });
 
-    // Filters: §5.1, §5.2, §5.3, §5.4.
     spans.retain(|s| !is_exception_particle(&chars, s.r));
     spans.retain(|s| !is_exception_numeric(&chars, s.l) && !is_exception_mailaddress(&chars, s.l));
     spans.retain(|s| !is_exception_no_parts(&chars, s.l, s.r));
 
-    // LinebreakForce: each linebreak (b, j) replaces the first span ending at
-    // b (unused linebreaks are appended). Boundary set is order-invariant
-    // (Lemma 2) — the boundary-level identity is checked by the test below.
     let lbreaks = linebreaks(&chars);
     let mut lb_by_start: HashMap<usize, (usize, usize)> =
         lbreaks.iter().map(|&(b, j)| (b, (b, j))).collect();
@@ -557,25 +476,11 @@ fn attach_sentence_closers(chars: &[char], boundaries: &mut [usize]) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// §8 Verification
-//
-// This file is also a standalone binary:
-//   cargo run  --bin spec_model   — exits non-zero on any divergence
-//   cargo test --test spec_model_cli — runs the binary and asserts every check passes
-// ---------------------------------------------------------------------------
-
 use std::collections::HashSet;
 use std::process::exit;
 
 use bunkai_rs::{segment, sentence_byte_boundaries, split_sentences};
 
-// ---- corpora ---------------------------------------------------------------
-
-/// The deterministic corpus: a hand-picked "bits" list, all pairs of it,
-/// RNG concatenations, and edge cases. Same construction style as the
-/// crate's other property suites (splitmix64, fixed seed).
 fn corpus() -> Vec<String> {
     const BITS: &[&str] = &[
         "日本語文章文字境界判定のための手順検証を行う",
@@ -697,11 +602,6 @@ fn corpus() -> Vec<String> {
     cases
 }
 
-/// Parse the `("text", &[..])` / `("text", vec![..])` case lists embedded
-/// in the auto-generated test files. Handles the escapes the generators
-/// emit (`\n \t \r \0 \\ \" \' \xNN \u{..}`) and fails loudly on any
-/// other escape. A string literal not followed by `, &[` / `, vec![`
-/// (e.g. the `"text: {text:?}"` assert message) is skipped, not a case.
 fn parse_case_file(src: &str) -> Vec<(String, Vec<usize>)> {
     let b = src.as_bytes();
     let mut cases = Vec::new();
@@ -714,7 +614,6 @@ fn parse_case_file(src: &str) -> Vec<(String, Vec<usize>)> {
                     cases.push((text, list));
                     next
                 }
-                // Stray literal (e.g. an assert message) — not a case.
                 None => after,
             };
         } else {
@@ -740,7 +639,7 @@ fn parse_string(b: &[u8], open: usize) -> (String, usize) {
                     }
                     let h = std::str::from_utf8(&b[i + 3..j]).unwrap();
                     out.push(char::from_u32(u32::from_str_radix(h, 16).unwrap()).unwrap());
-                    i = j + 1; // past the closing '}'
+                    i = j + 1;
                 }
                 b'x' => {
                     let h = std::str::from_utf8(&b[i + 2..i + 4]).unwrap();
@@ -765,7 +664,6 @@ fn parse_string(b: &[u8], open: usize) -> (String, usize) {
                 }
             },
             _ => {
-                // Copy one UTF-8 char through.
                 let n = utf8_len(b[i]);
                 out.push_str(std::str::from_utf8(&b[i..i + n]).unwrap());
                 i += n;
@@ -774,8 +672,6 @@ fn parse_string(b: &[u8], open: usize) -> (String, usize) {
     }
 }
 
-/// After a string literal, try to read `, &[` / `, vec![` plus a usize
-/// list. `None` if what follows is not a case tuple.
 fn try_parse_bounds_list(b: &[u8], mut i: usize) -> Option<(Vec<usize>, usize)> {
     let skip_ws = |mut i: usize| {
         while i < b.len() && b[i].is_ascii_whitespace() {
@@ -838,8 +734,6 @@ fn utf8_len(first: u8) -> usize {
     }
 }
 
-// ---- helpers ---------------------------------------------------------------
-
 fn char_to_byte(text: &str, char_idx: usize) -> usize {
     if char_idx >= text.chars().count() {
         return text.len();
@@ -854,10 +748,6 @@ fn spec_boundaries_bytes(text: &str) -> Vec<usize> {
         .collect()
 }
 
-// ---- checks (each returns Err on the first divergence) ----------------------
-
-/// T4: spec model == full pipeline == fast byte path on the generated
-/// corpus; plus T3 losslessness of `split_sentences`.
 fn check_generated() -> Result<(), String> {
     let cases = corpus();
     let mut checked = 0usize;
@@ -870,7 +760,6 @@ fn check_generated() -> Result<(), String> {
         if sentence_byte_boundaries(text) != spec_boundaries_bytes(text) {
             return Err(format!("spec vs fast path diverged on {text:?}"));
         }
-        // T3: lossless, contiguous, non-empty segmentation.
         let sentences = split_sentences(text);
         if sentences.concat() != *text {
             return Err(format!("losslessness broken on {text:?}"));
@@ -886,7 +775,6 @@ fn check_generated() -> Result<(), String> {
     Ok(())
 }
 
-/// T5: spec model reproduces the Python-derived golden corpus exactly.
 fn check_golden() -> Result<(), String> {
     let cases = parse_case_file(include_str!("../../tests/golden_regression.rs"));
     if cases.len() != 3_388 {
@@ -907,7 +795,6 @@ fn check_golden() -> Result<(), String> {
     Ok(())
 }
 
-/// T5: spec model reproduces the Python-derived differential corpus.
 fn check_differential() -> Result<(), String> {
     let cases = parse_case_file(include_str!("../../tests/differential.rs"));
     if cases.len() < 485 {
@@ -928,7 +815,6 @@ fn check_differential() -> Result<(), String> {
     Ok(())
 }
 
-/// T1: well-formedness of B(s) over the whole generated corpus.
 fn check_wellformedness() -> Result<(), String> {
     let cases = corpus();
     for text in &cases {
@@ -954,8 +840,6 @@ fn check_wellformedness() -> Result<(), String> {
     Ok(())
 }
 
-/// T6 + Lemma 1: rule classes are key-disjoint; the sentinel is the only
-/// collision partner, and only at its own key.
 fn check_first_wins() -> Result<(), String> {
     let cases = corpus();
     for text in &cases {
@@ -974,7 +858,7 @@ fn check_first_wins() -> Result<(), String> {
         }
         for ((l, r), kinds) in by_key {
             if (l, r) == sentinel_key {
-                continue; // sentinel collisions are the one allowed case
+                continue;
             }
             if kinds.len() != 1 {
                 return Err(format!(
@@ -986,8 +870,6 @@ fn check_first_wins() -> Result<(), String> {
     Ok(())
 }
 
-/// Lemma 2: the boundary-level linebreak formula (§6 of the spec) equals
-/// the replacement simulation on every corpus string.
 fn check_lemma2() -> Result<(), String> {
     let cases = corpus();
     for text in &cases {
@@ -995,7 +877,6 @@ fn check_lemma2() -> Result<(), String> {
         let n = chars.len();
         let sentinel_key = if n == 0 { (0, 0) } else { (n - 1, n) };
 
-        // Rebuild L₄ exactly as the pipeline does (§6).
         let mut spans: Vec<Span> = Vec::new();
         for s in basic_runs(&chars) {
             if (s.l, s.r) != sentinel_key {
@@ -1034,7 +915,6 @@ fn check_lemma2() -> Result<(), String> {
 
         let lbreaks = linebreaks(&chars);
 
-        // (a) Simulation (as in the implementation / pipeline).
         let mut lb: HashMap<usize, (usize, usize)> =
             lbreaks.iter().map(|&(b, j)| (b, (b, j))).collect();
         let mut sim: Vec<usize> = Vec::new();
@@ -1048,7 +928,6 @@ fn check_lemma2() -> Result<(), String> {
         }
         sim.extend(lb.into_values().map(|(_, r)| r));
 
-        // (b) Boundary-level formula of Lemma 2, over B(L₇) = ends(L₄).
         let lb_starts: HashSet<usize> = lbreaks.iter().map(|&(b, _)| b).collect();
         let mut l4_ends: Vec<usize> = spans.iter().map(|s| s.r).collect();
         l4_ends.sort_unstable();
@@ -1080,8 +959,6 @@ fn check_lemma2() -> Result<(), String> {
     }
     Ok(())
 }
-
-// ---- driver ----------------------------------------------------------------
 
 struct Check {
     name: &'static str,

@@ -10,8 +10,6 @@ keywords = ["japanese", "nlp", "sentence", "segmentation", "boundary"]
 categories = ["text-processing"]
 
 [features]
-# Enable the built-in BUNKAI_PROF stage-timing profiler (see src/core.rs).
-# Off by default so builds carry zero instrumentation overhead.
 prof = []
 
 [dev-dependencies]

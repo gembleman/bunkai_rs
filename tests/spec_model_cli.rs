@@ -1,7 +1,3 @@
-//! E2E: runs the `spec_model` verification binary (naive formula-faithful model vs. the
-//! optimized pipeline, golden and differential corpora) as a process; it exits non-zero on
-//! any divergence.
-
 use std::process::Command;
 
 #[test]

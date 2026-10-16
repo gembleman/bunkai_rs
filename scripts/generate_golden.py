@@ -1,21 +1,4 @@
 #!/usr/bin/env python3
-"""Regenerate tests/golden_regression.rs.
-
-The golden file records the `final_boundaries` produced by the *original*
-(pre-optimisation) bunkai_rs for a large, deterministic pseudo-random corpus,
-so the optimised implementation can be proven byte-for-byte equivalent.
-
-It works by materialising the original sources (`git show HEAD:src/...`) into a
-scratch Cargo crate, building the generator binary, running it, and writing its
-stdout (a self-contained Rust test) to tests/golden_regression.rs.
-
-Requires: `cargo` and `rustc` on PATH, and this repo to be a git checkout whose
-HEAD contains the pre-optimisation sources.
-
-Usage:
-    python3 scripts/generate_golden.py
-"""
-
 import subprocess
 import tempfile
 from pathlib import Path
@@ -99,8 +82,6 @@ fn main() {
     }
 
     let mut out = String::new();
-    out.push_str("// AUTO-GENERATED golden regression vs the original implementation.\n");
-    out.push_str("// Regenerate with scripts/generate_golden.py (see repo root). Do not edit.\n");
     out.push_str("use bunkai_rs::segment;\n\n#[test]\nfn golden_regression_matches_original() {\n    let cases: &[(&str, &[usize])] = &[\n");
     for c in &cases {
         let seg = segment(c);

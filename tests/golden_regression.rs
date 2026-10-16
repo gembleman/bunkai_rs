@@ -1,5 +1,3 @@
-// AUTO-GENERATED golden regression vs the original implementation.
-// Regenerate with scripts/generate_golden.py (see repo root). Do not edit.
 use bunkai_rs::segment;
 
 fn with_closing_marks(text: &str, expected: &[usize]) -> Vec<usize> {

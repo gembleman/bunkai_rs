@@ -1,12 +1,7 @@
-//! Public-API behavior that the golden/differential corpora do not pin down.
-
 use bunkai_rs::{EMOJI_DATA, segment, split_sentences};
 
-/// Categories whose emoji end a sentence (restated independently of the implementation).
 const TARGET_CATEGORIES: &[&str] = &["Smileys & Emotion", "Symbols"];
 
-/// Every entry of the public emoji table must behave per its category: a target-category
-/// emoji closes the sentence, any other (incl. uncategorised modifiers) must not.
 #[test]
 fn every_emoji_table_entry_splits_according_to_its_category() {
     let mut mismatches = Vec::new();
@@ -24,8 +19,6 @@ fn every_emoji_table_entry_splits_according_to_its_category() {
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
-/// All 25 Unicode White_Space code points count as whitespace for the newline rule, and
-/// ordinary characters do not.
 #[test]
 fn every_unicode_white_space_char_joins_a_newline_run() {
     let ws: &[char] = &[
@@ -44,14 +37,12 @@ fn every_unicode_white_space_char_joins_a_newline_run() {
             w as u32
         );
     }
-    // 공백이 아닌 문자는 줄바꿈 런에 합류하지 않는다.
     let got = split_sentences("あいう。\nえおか");
     assert_eq!(got.len(), 2);
     let got = split_sentences("あいうa\nえおか");
     assert_eq!(got, vec!["あいうa\n", "えおか"]);
 }
 
-/// Regression: `cjk_skip_run` once treated `E2 81 xx` (U+2049, U+205F) like kana lead bytes.
 #[test]
 fn known_bug_fast_path_skips_e2_81_chars() {
     let text = "日本語の文章⁉次の文章";
@@ -59,8 +50,6 @@ fn known_bug_fast_path_skips_e2_81_chars() {
     assert_eq!(split_sentences("あいう\u{205F}\nえおか").len(), 2);
 }
 
-/// The boundaries-only fast path must agree with the full pipeline for every code point in
-/// U+2000..=U+206F (General Punctuation) embedded in CJK text, in several positions.
 #[test]
 fn general_punctuation_block_fast_path_matches_segment() {
     for cp in 0x2000u32..=0x206F {
@@ -88,4 +77,17 @@ fn general_punctuation_block_fast_path_matches_segment() {
             assert_eq!(split_sentences(&text), expected, "U+{cp:04X} in {text:?}");
         }
     }
+}
+
+#[test]
+fn segment_reports_final_boundaries_and_last_layer() {
+    let seg = segment("これは一文目。これは二文目。");
+    assert_eq!(seg.final_boundaries, vec![7, 14]);
+    assert_eq!(seg.layers.last().unwrap().name, "LinebreakForceAnnotator");
+}
+
+#[test]
+fn split_sentences_returns_each_sentence_as_a_substring() {
+    let sentences = split_sentences("これは一文目。これは二文目。");
+    assert_eq!(sentences, vec!["これは一文目。", "これは二文目。"]);
 }

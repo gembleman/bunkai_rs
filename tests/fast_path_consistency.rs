@@ -1,21 +1,7 @@
-//! Public-API consistency: the boundaries-only fast path (`sentence_byte_boundaries` /
-//! `split_sentences`) must equal the layer-building pipeline (`segment`) on every input.
-
 use bunkai_rs::{segment, sentence_byte_boundaries, split_sentences};
 
 #[test]
 fn byte_skip_boundary_safety() {
-    // `scan_bounds_bytes` bulk-advances past boring ASCII and runs of pure
-    // kana/kanji bytes (see `ascii_skip_run` and `cjk_skip_run`). The byte
-    // ranges it skips are provably disjoint
-    // from every trigger/whitespace/emoji codepoint, but that proof rests
-    // on excluding the *exact* dangerous patterns: 。/　 (E3 80),
-    // ！？． (EF BC), the E3 8A emoji ⚗ U+3297 / ⚙ U+3299, and ASCII
-    // .!?/whitespace. This test pins that invariant by placing each of
-    // those patterns directly against long kana/kanji runs — including the
-    // E3 8A emoji that the existing differential/golden corpus never
-    // touches — so a wrong exclusion would change the boundary set instead
-    // of passing by luck.
     const KANA: &[&str] = &[
         "日本語の文章",
         "かなかな",
@@ -40,7 +26,6 @@ fn byte_skip_boundary_safety() {
             cases.push(format!("{k}{d}\n{k}"));
             cases.push(format!("{k}\n{d}{k}"));
         }
-        // a long pure CJK run with no danger (exercises the bulk skip itself)
         cases.push(format!("{k}{k}{k}{k}"));
     }
     for a in KANA {
@@ -80,9 +65,6 @@ fn byte_skip_boundary_safety() {
 
 #[test]
 fn bounds_only_path_matches_full_pipeline() {
-    // The boundaries-only fast path used by split_sentences must produce
-    // the exact final boundaries of the layer-building pipeline. Drive
-    // both over a deterministic corpus hitting every rule interaction.
     const BITS: &[&str] = &[
         "日本語文章文字境界判定のための手順検証を行う",
         "あいうえおかきくけこさしすせそ",
@@ -202,8 +184,6 @@ fn bounds_only_path_matches_full_pipeline() {
     for (i, text) in cases.iter().enumerate() {
         let via_layers = segment(text).final_boundaries;
         let via_bounds = sentence_byte_boundaries(text);
-        // `final_boundaries` are char indices; the byte path returns byte
-        // offsets. Convert one to the other for the direct comparison.
         let mut via_layers_bytes: Vec<usize> = Vec::with_capacity(via_layers.len());
         let mut bi = 0usize;
         for (char_idx, (byte, _)) in text.char_indices().enumerate() {
@@ -213,7 +193,6 @@ fn bounds_only_path_matches_full_pipeline() {
             }
         }
         if bi < via_layers.len() {
-            // Trailing boundary equals the character count → byte length.
             debug_assert_eq!(via_layers[bi], text.chars().count());
             via_layers_bytes.push(text.len());
         }
@@ -221,9 +200,6 @@ fn bounds_only_path_matches_full_pipeline() {
             via_bounds, via_layers_bytes,
             "case #{i} bounds-only diverges from full pipeline: {text:?}"
         );
-        // Property check for the slicing: split_sentences must cut exactly
-        // at the pipeline boundaries — lossless, contiguous, and every hard
-        // cut aligned with the next boundary offset.
         let sentences = split_sentences(text);
         let mut cum_bytes = 0usize;
         for (k, s) in sentences.iter().enumerate() {

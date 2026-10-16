@@ -1,22 +1,11 @@
-//! Differential tests ported from the original Python `bunkai` reference suite
-//! (https://github.com/megagonlabs/bunkai, `tests/bunkai_sbd/test_bukai_sbd.py`).
-//!
-//! They drive the public `segment` API and check that the pipeline produces the
-//! exact sentence splits the Python implementation is expected to produce.
-//! Where expectations could not be taken verbatim from the reference tests,
-//! they were verified against a live invocation of the Python reference.
-
 use bunkai_rs::{Segmentation, segment};
 
-/// Split `text` into sentences according to the pipeline's final boundaries.
 fn sentences(text: &str) -> Vec<String> {
     let seg = segment(text);
     boundaries_to_sentences(text, &seg)
 }
 
 fn boundaries_to_sentences(text: &str, seg: &Segmentation<'_>) -> Vec<String> {
-    // `final_boundaries` holds char (Unicode scalar) offsets; convert them to
-    // byte offsets so we can slice the original `&str`.
     let char_to_byte: Vec<usize> = text
         .char_indices()
         .map(|(byte, _)| byte)
@@ -41,7 +30,6 @@ fn boundaries_to_sentences(text: &str, seg: &Segmentation<'_>) -> Vec<String> {
     out
 }
 
-/// The names of the rules that produced the final layer's spans.
 fn final_rule_names(text: &str) -> Vec<String> {
     let seg = segment(text);
     seg.layers
@@ -62,7 +50,6 @@ fn final_rule_names(text: &str) -> Vec<String> {
 
 #[test]
 fn test_various_inputs_matches_reference() {
-    // Case 1
     {
         let text = "これが１文目です。。。。そして、これが２文目…３文目。";
         assert_eq!(
@@ -74,7 +61,6 @@ fn test_various_inputs_matches_reference() {
             ]
         );
     }
-    // Case 2
     {
         let text = "宿を予約しました♪!まだ2ヶ月も先だけど。早すぎかな(笑)楽しみです★";
         assert_eq!(
@@ -87,7 +73,6 @@ fn test_various_inputs_matches_reference() {
             ]
         );
     }
-    // Case 3: emoji
     {
         let text = "宿を予約しました😄まだ2ヶ月も先だけど😄早すぎかな(笑)楽しみです★";
         assert_eq!(
@@ -100,7 +85,6 @@ fn test_various_inputs_matches_reference() {
             ]
         );
     }
-    // Case 4: repeated emoji
     {
         let text = "宿を予約しました😄😄😄まだ2ヶ月も先だけど😄😄😄早すぎかな(笑)楽しみです★";
         assert_eq!(
@@ -113,7 +97,6 @@ fn test_various_inputs_matches_reference() {
             ]
         );
     }
-    // Case 5: facemark with slash-joy
     {
         let text = "宿を予約しました＼(^o^)／まだ2ヶ月も先だけど。早すぎかな(笑)楽しみです★";
         assert_eq!(
@@ -126,7 +109,6 @@ fn test_various_inputs_matches_reference() {
             ]
         );
     }
-    // Case 6: indirect quote particle after a newline
     {
         let text = "この値段で、こんな夕飯いいの？\nって、くらいおいしかった！";
         assert_eq!(
@@ -137,7 +119,6 @@ fn test_various_inputs_matches_reference() {
             ]
         );
     }
-    // Case 7: bare newlines only
     {
         let text = "\n\n123\n45\n\n6\n  \n7\n";
         assert_eq!(
@@ -145,7 +126,6 @@ fn test_various_inputs_matches_reference() {
             vec!["\n\n", "123\n", "45\n\n", "6\n  \n", "7\n"]
         );
     }
-    // Case 8: mixed facemark / emoji / indirect quote
     {
         let text = "これは入力の入力サンプルです(^o^)絵文字の文末記号も認識します😀引用文も大丈夫？と思いませんか？引用文の過剰分割を防げるんです👍";
         assert_eq!(
@@ -158,12 +138,10 @@ fn test_various_inputs_matches_reference() {
             ]
         );
     }
-    // Case 9: No.1 (number exception)
     {
         let text = "本商品はおすすめ度No.1です。";
         assert_eq!(sentences(text), vec!["本商品はおすすめ度No.1です。"]);
     }
-    // Case 10: 「No.1です！」 followed by further text and indirect quote
     {
         let text = "本商品はおすすめ度No.1です！という売り文句の新商品が出ている。しかし、この商品は本当に信用できるのだろうか？私はとても懐疑的である。";
         assert_eq!(
@@ -175,7 +153,6 @@ fn test_various_inputs_matches_reference() {
             ]
         );
     }
-    // Case 11: dangling "No." at the end
     {
         let text = "本商品はおすすめ度No.";
         assert_eq!(sentences(text), vec!["本商品はおすすめ度No."]);
@@ -184,21 +161,18 @@ fn test_various_inputs_matches_reference() {
 
 #[test]
 fn test_various_inputs_expected_rules() {
-    // Case 1: emotion + basic
     {
         let text = "これが１文目です。。。。そして、これが２文目…３文目。";
         let mut names = final_rule_names(text);
         names.sort();
         assert_eq!(names, vec!["BasicRule", "EmotionExpressionAnnotator"]);
     }
-    // Case 3: emotion + emoji
     {
         let text = "宿を予約しました😄まだ2ヶ月も先だけど😄早すぎかな(笑)楽しみです★";
         let mut names = final_rule_names(text);
         names.sort();
         assert_eq!(names, vec!["EmojiAnnotator", "EmotionExpressionAnnotator"]);
     }
-    // Case 5: emotion + basic + facemark
     {
         let text = "宿を予約しました＼(^o^)／まだ2ヶ月も先だけど。早すぎかな(笑)楽しみです★";
         let mut names = final_rule_names(text);
@@ -212,21 +186,18 @@ fn test_various_inputs_expected_rules() {
             ]
         );
     }
-    // Case 6: linebreak (indirect quote suppressed the 「？」 boundary)
     {
         let text = "この値段で、こんな夕飯いいの？\nって、くらいおいしかった！";
         let mut names = final_rule_names(text);
         names.sort();
         assert_eq!(names, vec!["LinebreakForceAnnotator"]);
     }
-    // Case 7: linebreak
     {
         let text = "\n\n123\n45\n\n6\n  \n7\n";
         let mut names = final_rule_names(text);
         names.sort();
         assert_eq!(names, vec!["LinebreakForceAnnotator"]);
     }
-    // Case 8: basic + facemark + emoji
     {
         let text = "これは入力の入力サンプルです(^o^)絵文字の文末記号も認識します😀引用文も大丈夫？と思いませんか？引用文の過剰分割を防げるんです👍";
         let mut names = final_rule_names(text);
@@ -236,12 +207,10 @@ fn test_various_inputs_expected_rules() {
             vec!["BasicRule", "EmojiAnnotator", "FaceMarkDetector"]
         );
     }
-    // Case 9: No.1 → only first remains
     {
         let text = "本商品はおすすめ度No.1です。";
         assert_eq!(final_rule_names(text), Vec::<String>::new());
     }
-    // Case 11: dangling No. → only first
     {
         let text = "本商品はおすすめ度No.";
         assert_eq!(final_rule_names(text), Vec::<String>::new());
@@ -250,8 +219,6 @@ fn test_various_inputs_expected_rules() {
 
 #[test]
 fn test_setup_sentence_variations() {
-    // From setUp() of TestBunkaiSbd.test_various_inputs. None of these may
-    // panic, and the concatenation of the produced sentences must round-trip.
     let texts = [
         "まずは一文目(^!^)つぎに二文目(^^)これ、テスト文なんですけど(笑)本当?にこんなテキストでいいのかな☆",
         "10秒で考えて書いたよ.",
@@ -274,9 +241,6 @@ fn test_setup_sentence_variations() {
 
 #[test]
 fn test_live_reference_corpus() {
-    // Sentences follow the Python reference plus this crate's closing-mark
-    // rule: a quote/bracket immediately after a boundary stays with the
-    // preceding sentence.
     let cases: &[(&str, Vec<&str>)] = &[
         ("うーん🤔🤔🤔どうしよう", vec!["うーん🤔🤔🤔", "どうしよう"]),
         (
@@ -311,7 +275,6 @@ fn test_live_reference_corpus() {
 
 #[test]
 fn test_basic_rule() {
-    // From tests/bunkai_sbd/annotator/test_basic_annotator.py
     assert_eq!(
         sentences("１文目。２文目！３文目？"),
         vec!["１文目。", "２文目！", "３文目？"]
@@ -320,13 +283,11 @@ fn test_basic_rule() {
         sentences("１文目.２文目．３文目。"),
         vec!["１文目.", "２文目．", "３文目。"]
     );
-    // Punctuation runs and trailing whitespace belong to the leading sentence.
     assert_eq!(sentences("良い。 次。"), vec!["良い。 ", "次。"]);
 }
 
 #[test]
 fn test_emotion_expression() {
-    // From tests/bunkai_sbd/annotator/test_emotion_expression_annotator.py
     assert_eq!(
         sentences("１文目（笑）２文目（汗）３文目（泣）"),
         vec!["１文目（笑）", "２文目（汗）", "３文目（泣）"]
@@ -339,7 +300,6 @@ fn test_emotion_expression() {
 
 #[test]
 fn test_emoji_annotator() {
-    // From tests/bunkai_sbd/annotator/test_emoji_annotator.py
     assert_eq!(
         sentences("うーん🤔🤔🤔どうしよう"),
         vec!["うーん🤔🤔🤔", "どうしよう"]
@@ -357,8 +317,6 @@ fn test_emoji_annotator() {
 
 #[test]
 fn test_emoji_full_pipeline_boundaries() {
-    // `うーん` + 3×U+1F914 + `どうしよう` = 11 chars. 🤔 (Smileys) is a target
-    // category, so the emoji run ends at char 6, and the sentinel adds char 11.
     let seg = segment("うーん🤔🤔🤔どうしよう");
     assert_eq!(seg.final_boundaries, vec![6, 11]);
     assert_eq!(seg.layers.last().unwrap().name, "LinebreakForceAnnotator");
@@ -366,7 +324,6 @@ fn test_emoji_full_pipeline_boundaries() {
 
 #[test]
 fn test_dot_exception() {
-    // From tests/bunkai_sbd/annotator/test_numeric_expression_exception_annotator.py
     assert_eq!(sentences("和室3.5畳"), vec!["和室3.5畳"]);
     assert_eq!(
         sentences("1.5リットル以上のペットボトル"),
@@ -385,7 +342,6 @@ fn test_dot_exception() {
 
 #[test]
 fn test_number_exception() {
-    // From tests/bunkai_sbd/annotator/test_number_exception_annotator.py
     assert_eq!(sentences("No.1の商品"), vec!["No.1の商品"]);
     assert_eq!(
         sentences("ROOM No.411を予約しました。"),
@@ -396,8 +352,6 @@ fn test_number_exception() {
 
 #[test]
 fn test_facemark_subset() {
-    // A representative subset of tests/bunkai_sbd/annotator/test_facemark_detector.py.
-    // Each (text, expected_end) states the end index of the only detected facemark.
     let cases: &[(&str, usize)] = &[
         ("いい湯でした(^_^)", 11),
         ("品揃えは良い(^*^*)", 12),
@@ -405,10 +359,10 @@ fn test_facemark_subset() {
         ("品揃えは良い(*´艸｀*)", 13),
         ("子供連れによいヽ(=´▽`=)ﾉ", 15),
         ("食事はよかった(^^;)", 12),
-        ("いい湯でした(^_^)y-~~~", 11), // `y-~~~` is not suffix-class; verified live
+        ("いい湯でした(^_^)y-~~~", 11),
         ("品揃えは良い(^_^)MFG", 11),
         ("いい湯でした(^_^)食事はよかった", 11),
-        ("サービスは良好(&gt;_&lt;)", 18), // HTML entities `&gt;` `&lt;` are face-symbol chars
+        ("サービスは良好(&gt;_&lt;)", 18),
     ];
 
     for &(text, expected_end) in cases {
@@ -436,9 +390,6 @@ fn test_facemark_subset() {
 
 #[test]
 fn test_facemark_interior_basic_rule_punctuation() {
-    // The reference lets `!` inside `(^!^)` become its own boundary, but does not
-    // let inside-facemark text fragments with no punctuation split further.
-    // Verified against the live Python reference.
     let text = "まずは一文目(^!^)つぎに二文目(^^)これ、テスト文なんですけど(笑)本当?にこんなテキストでいいのかな☆";
     assert_eq!(
         sentences(text),
@@ -459,7 +410,6 @@ fn test_facemark_interior_basic_rule_punctuation() {
 #[test]
 fn test_empty_and_short_inputs() {
     assert_eq!(segment("").final_boundaries, vec![0]);
-    // The pipeline always ends on the LinebreakForceAnnotator layer.
     assert_eq!(
         segment("").layers.last().unwrap().name,
         "LinebreakForceAnnotator"
@@ -476,8 +426,6 @@ fn test_empty_and_short_inputs() {
 
 #[test]
 fn test_multibyte_offsets_are_char_offsets() {
-    // All offsets must be in Unicode scalar values, not bytes.
-    // "日本語です。" ends at char 6; "Englishです。" is 10 more chars → 16.
     let text = "日本語です。Englishです。";
     let seg = segment(text);
     assert_eq!(seg.final_boundaries, vec![6, 16]);
@@ -486,10 +434,6 @@ fn test_multibyte_offsets_are_char_offsets() {
 
 #[test]
 fn test_segment_preserves_every_pipeline_layer_snapshot() {
-    // This input exercises every annotator and each of the four exception
-    // stages.  The expected snapshots are deliberately written as literals:
-    // checking only the final boundaries would miss a stage mutating its
-    // predecessor in place.
     let text = "★ A?て😀。3.5 No.1(^_^)\n";
     let seg = segment(text);
 

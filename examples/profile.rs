@@ -1,6 +1,3 @@
-//! Profiling harness: run the hot path repeatedly so `perf` can sample it.
-//!   perf record --call-graph dwarf ./target/release/examples/profile
-//!   perf report
 use bunkai_rs::{segment, split_sentences};
 
 fn corpus() -> String {
@@ -20,7 +17,6 @@ fn main() {
     let bytes = text.len();
     let iters = 400;
 
-    // warmup
     std::hint::black_box(segment(&text));
 
     let t0 = std::time::Instant::now();

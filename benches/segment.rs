@@ -1,30 +1,8 @@
-//! Benchmark the bunkai_rs sentence-boundary disambiguation pipeline.
-//!
-//! Run with:
-//!   cargo bench                      # everything
-//!   cargo bench --bench segment      # just this file
-//!
-//! The `bench` Cargo profile inherits from `[profile.release]` in Cargo.toml,
-//! so LTO + codegen-units=1 apply to the measured build. Three text sizes are
-//! measured for both public entry points:
-//!
-//! * `short`  — a single sentence (~30 bytes), e.g. a chat message or a tweet.
-//! * `medium` — ~7 KB, a typical article or chat log.
-//! * `long`   — ~56 KB, a long document or batch of posts.
-//!
-//! The workload matrix also separates ASCII-heavy, CJK/Kana, emoji/kaomoji,
-//! punctuation-dense, no-boundary, sparse-newline, dense-newline, and tiny
-//! inputs. Non-empty groups report throughput in bytes per second.
-
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
 use bunkai_rs::{segment, split_sentences};
 
-/// A few KB of realistic Japanese text mixing everything the pipeline has to
-/// handle: plain periods, question/exclamation marks, emoji, kaomoji, emotion
-/// expressions, decimal numbers, "No." ordinals, indirect quotes and line
-/// breaks.
 fn medium_text() -> String {
     const SENTENCES: &[&str] = &[
         "宿を予約しました😄まだ2ヶ月も先だけど。早すぎかな(笑)楽しみです★",
@@ -49,7 +27,6 @@ fn medium_text() -> String {
         "おしまい♪また明日！",
     ];
 
-    // ~100 sentences: realistic single-shot input (~7 KB).
     let mut out = String::with_capacity(16 * 1024);
     for s in SENTENCES.iter().cycle().take(100) {
         out.push_str(s);
@@ -63,11 +40,9 @@ fn short_text() -> String {
 }
 
 fn long_text() -> String {
-    medium_text().repeat(8) // ~56 KB
+    medium_text().repeat(8)
 }
 
-/// Latin-heavy text exercises the common ASCII path and the emoji lookup's
-/// low-codepoint rejection without making the corpus completely artificial.
 fn ascii_heavy_text() -> String {
     const FRAGMENT: &str = "Release 2026.08: job #12345 completed in 3.14s; retry=0, status=ok. ";
     FRAGMENT.repeat(128)
@@ -89,10 +64,6 @@ fn punctuation_dense_text() -> String {
     FRAGMENT.repeat(128)
 }
 
-/// Low-codepoint symbols exercise the U+00A9..U+3299 emoji lookup block. The
-/// corpus mixes target entries (symbols and smileys), non-target emoji entries
-/// (objects, travel, food, and activities), absent neighbors, and ordinary
-/// Latin-1/CJK text in UI-like notifications rather than repeating one symbol.
 fn low_symbol_heavy_text() -> String {
     const FRAGMENT: &str = concat!(
         "Support © 2026 Acme® — status=ok™; info ℹ️. ",
@@ -106,8 +77,6 @@ fn low_symbol_heavy_text() -> String {
     FRAGMENT.repeat(24)
 }
 
-/// A long, terminator-free run isolates scanning cost when no boundaries are
-/// emitted. It intentionally contains spaces and digits but no sentence mark.
 fn no_boundary_text() -> String {
     const FRAGMENT: &str =
         "this is one deliberately long sentence with numbers 12345 and words only ";
