@@ -4,3 +4,8 @@
 - done: ~680 comment lines removed; pub API docs moved to README (now also crate docs via `#![doc = include_str!("../README.md")]`); doctests -> tests/public_api_e2e.rs; rationale in docs/rationale/bunkai_rs.md (whitelisted in .gitignore).
 - next: merge into master (Forgejo); decide generator drift in issue #1.
 - caveat: README usage block is `rust,ignore` so it doesn't become a doctest; cargo test 27/27.
+
+## 2026-10-29 deps (chore/deps-2026-10-29)
+- done: cargo update (lock only, 23 crates). cargo test 27/27.
+- next: merge into master.
+- caveat: none.
