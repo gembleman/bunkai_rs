@@ -4,6 +4,7 @@
 /docs
 *.md
 !README.md
+!AGENTS.md
 !/docs/
 !/docs/optimization-audit.md
 !/docs/split-sentences-optimization-roadmap.md
