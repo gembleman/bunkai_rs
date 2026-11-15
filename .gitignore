@@ -11,3 +11,4 @@
 !/docs/rationale/
 !/docs/rationale/*.md
 !/docs/HANDOFF.md
+__pycache__/
