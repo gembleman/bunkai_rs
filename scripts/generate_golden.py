@@ -16,7 +16,7 @@ ORIGINAL_REV = "e1cb12f^"
 
 GEN_SRC = r'''
 //! Generate a golden regression corpus using the ORIGINAL bunkai_rs
-//! implementation (regex-based, HashMap emoji, owned Strings). Emits a
+//! implementation (regex-based, HashMap emoji, owned Strings). Emits only
 //! the test case rows; the Python driver wraps them into the test file.
 
 use bunkai_orig::segment;
