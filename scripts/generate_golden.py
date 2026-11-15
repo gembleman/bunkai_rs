@@ -129,15 +129,9 @@ def main() -> None:
             (tmp / "src" / name).write_text(src)
         (tmp / "src" / "bin" / "gen_golden.rs").write_text(GEN_SRC)
 
-        subprocess.run(
-            ["cargo", "run", "--release", "--bin", "gen_golden"],
-            cwd=tmp,
-            check=True,
-            capture_output=True,
-            timeout=600,
-        )
+        # `cargo run` keeps this independent of where the host's target dir is.
         gen = subprocess.run(
-            [str(tmp / "target" / "release" / "gen_golden")],
+            ["cargo", "run", "--release", "--quiet", "--bin", "gen_golden"],
             cwd=tmp,
             check=True,
             capture_output=True,
