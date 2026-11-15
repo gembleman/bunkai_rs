@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
+import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from rust_emit import WITH_CLOSING_MARKS, rustfmt  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
+
+# Last commit before closing marks were attached to boundaries; its output is
+# the reference the committed golden values were recorded from.
+ORIGINAL_REV = "e1cb12f^"
 
 GEN_SRC = r'''
 //! Generate a golden regression corpus using the ORIGINAL bunkai_rs
 //! implementation (regex-based, HashMap emoji, owned Strings). Emits a
-//! self-contained Rust test that the optimised crate can compile and run.
+//! the test case rows; the Python driver wraps them into the test file.
 
 use bunkai_orig::segment;
 
@@ -82,12 +91,10 @@ fn main() {
     }
 
     let mut out = String::new();
-    out.push_str("use bunkai_rs::segment;\n\n#[test]\nfn golden_regression_matches_original() {\n    let cases: &[(&str, &[usize])] = &[\n");
     for c in &cases {
         let seg = segment(c);
         out.push_str(&format!("        ({:?}, &{:?}),\n", c, seg.final_boundaries));
     }
-    out.push_str("    ];\n    for (text, expected) in cases {\n        let seg = segment(text);\n        assert_eq!(&seg.final_boundaries, expected, \"text: {text:?}\");\n    }\n}\n");
     print!("{out}");
 }
 '''
@@ -113,7 +120,7 @@ def main() -> None:
         (tmp / "Cargo.toml").write_text(CARGO_TOML)
         for name in ("lib.rs", "core.rs", "emoji_data.rs"):
             src = subprocess.run(
-                ["git", "show", f"HEAD:src/{name}"],
+                ["git", "show", f"{ORIGINAL_REV}:src/{name}"],
                 cwd=ROOT,
                 check=True,
                 capture_output=True,
@@ -137,8 +144,22 @@ def main() -> None:
             text=True,
             timeout=600,
         )
-        (ROOT / "tests" / "golden_regression.rs").write_text(gen.stdout)
-        print(f"wrote tests/golden_regression.rs with {gen.stdout.count('("')} cases")
+        rows = gen.stdout
+        test = (
+            "use bunkai_rs::segment;\n"
+            + WITH_CLOSING_MARKS
+            + "\n#[test]\nfn golden_regression_matches_original() {\n"
+            + "    let cases: &[(&str, &[usize])] = &[\n"
+            + rows
+            + "    ];\n    for (text, expected) in cases {\n"
+            + "        let seg = segment(text);\n"
+            + "        assert_eq!(\n            seg.final_boundaries,\n"
+            + "            with_closing_marks(text, expected),\n"
+            + '            "text: {text:?}"\n        );\n    }\n}\n'
+        )
+        out = Path(os.environ.get("GOLDEN_OUT", ROOT / "tests" / "golden_regression.rs"))
+        out.write_text(rustfmt(test))
+        print(f"wrote {out} with {rows.count(chr(10))} cases")
 
 
 if __name__ == "__main__":

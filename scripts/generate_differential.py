@@ -7,6 +7,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from rust_emit import WITH_CLOSING_MARKS, rustfmt  # noqa: E402
+
 REPO = Path(__file__).resolve().parent.parent
 REF = Path(os.environ.get("BUNKAI_REF", "/tmp/bunkai_ref"))
 
@@ -149,7 +152,7 @@ def main() -> None:
 
     lines = [
         "use bunkai_rs::segment;",
-        "",
+        WITH_CLOSING_MARKS,
         "#[test]",
         "fn differential_matches_python_reference() {",
         "    let cases: &[(&str, Vec<usize>)] = &[",
@@ -163,15 +166,17 @@ def main() -> None:
         "    for (i, (text, expected)) in cases.iter().enumerate() {",
         "        let seg = segment(text);",
         "        assert_eq!(",
-        '            seg.final_boundaries, *expected,',
+        "            seg.final_boundaries,",
+        "            with_closing_marks(text, expected),",
         '            "case #{i} diverges from python reference: {text:?}"',
         "        );",
         "    }",
         "}",
         "",
     ]
-    (REPO / "tests" / "differential.rs").write_text("\n".join(lines))
-    print(f"wrote {len(corpus)} cases to tests/differential.rs")
+    out = Path(os.environ.get("DIFFERENTIAL_OUT", REPO / "tests" / "differential.rs"))
+    out.write_text(rustfmt("\n".join(lines)))
+    print(f"wrote {len(corpus)} cases to {out}")
 
 
 if __name__ == "__main__":
